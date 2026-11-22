@@ -70,6 +70,8 @@ jobs:
             build_name: "Just Game definitions"
           - build_type: "--no-default-features --features serde"
             build_name: "Just serde"
+          - build_type: "--no-default-features --features tokio"
+            build_name: "Just tokio"
     name: "Build library ${{ matrix.build_name }}"
     steps:
       - uses: actions/checkout@v5

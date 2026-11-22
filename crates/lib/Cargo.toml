@@ -37,6 +37,11 @@ packet_capture = ["dep:pcap-file", "dep:pnet_packet", "dep:lazy_static"]
 # Enable TLS for HTTP Client
 tls = ["ureq/tls"]
 
+# Enable non-blocking queries on the Tokio runtime (currently the Valve
+# protocol: `protocols::valve::tokio::query`). Additive: the blocking API is
+# unchanged.
+tokio = ["dep:tokio"]
+
 [dependencies]
 url         = "2.5.8"
 byteorder   = "1.5.0"
@@ -52,9 +57,11 @@ clap        = { version = "4.5.60", optional = true, features = ["derive"] }
 pcap-file   = { version = "2.0.0", optional = true }
 pnet_packet = { version = "0.35.0", optional = true }
 lazy_static = { version = "1.5.0", optional = true }
+tokio       = { version = "1.43", optional = true, default-features = false, features = ["net", "time"] }
 
 [dev-dependencies]
 gamedig-id-tests = { path = "../id-tests", default-features = false }
+tokio            = { version = "1.43", features = ["macros", "rt-multi-thread", "net", "time"] }
 
 # Examples
 [[example]]
@@ -76,3 +83,7 @@ required-features = ["games"]
 [[example]]
 name              = "generic"
 required-features = ["games", "game_defs"]
+
+[[example]]
+name              = "valve_protocol_query_tokio"
+required-features = ["tokio"]

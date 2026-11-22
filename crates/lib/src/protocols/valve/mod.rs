@@ -3,6 +3,11 @@ pub mod protocol;
 /// All types used by the implementation.
 pub mod types;
 
+// Non-blocking queries on the Tokio runtime (`tokio` feature). Documented with
+// inner docs in tokio.rs so its intra-doc links resolve in that module.
+#[cfg(feature = "tokio")]
+pub mod tokio;
+
 pub use protocol::*;
 pub use types::*;
 

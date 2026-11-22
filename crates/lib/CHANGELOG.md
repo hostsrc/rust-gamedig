@@ -2,6 +2,11 @@ Who knows what the future holds...
 
 # X.Y.Z - DD/MM/YYYY
 
+Protocols:
+
+- Valve: new opt-in `tokio` feature with a non-blocking `protocols::valve::tokio::query`, sharing all packet parsing with the blocking `valve::query` (which is unchanged). See the `valve_protocol_query_tokio` example.
+- Valve: split responses are now reassembled correctly when their UDP chunks arrive out of order (previously the first chunk received was always treated as chunk 0, corrupting the payload).
+
 # 0.9.0 22/02/2026
 
 Breaking:

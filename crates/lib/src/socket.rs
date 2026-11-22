@@ -172,6 +172,72 @@ impl Socket for UdpSocketImpl {
     fn local_addr(&self) -> std::io::Result<SocketAddr> { self.socket.local_addr() }
 }
 
+/// Non-blocking UDP socket built on Tokio.
+///
+/// Mirrors [UdpSocketImpl]: binds an ephemeral local port, sends to the
+/// remote with `send_to` and accepts the next datagram with `recv_from`.
+/// Read and write timeouts from [TimeoutSettings] are enforced with
+/// [tokio::time::timeout]; an elapsed timeout is reported as
+/// [PacketReceive] / [PacketSend] so the existing retry logic applies.
+///
+/// Packet capture is not supported on this socket.
+#[cfg(feature = "tokio")]
+pub(crate) struct AsyncUdpSocket {
+    socket: ::tokio::net::UdpSocket,
+    address: SocketAddr,
+    read_timeout: Option<std::time::Duration>,
+    write_timeout: Option<std::time::Duration>,
+}
+
+#[cfg(feature = "tokio")]
+impl AsyncUdpSocket {
+    pub(crate) async fn new(address: &SocketAddr, timeout_settings: &Option<TimeoutSettings>) -> GDResult<Self> {
+        let socket = ::tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| SocketBind.context(e))?;
+        let (read_timeout, write_timeout) = TimeoutSettings::get_read_and_write_or_defaults(timeout_settings);
+
+        Ok(Self {
+            socket,
+            address: *address,
+            read_timeout,
+            write_timeout,
+        })
+    }
+
+    pub(crate) async fn send(&mut self, data: &[u8]) -> GDResult<()> {
+        let send = self.socket.send_to(data, self.address);
+        let result = match self.write_timeout {
+            Some(timeout) => {
+                ::tokio::time::timeout(timeout, send)
+                    .await
+                    .map_err(|e| PacketSend.context(e))?
+            }
+            None => send.await,
+        };
+
+        result.map_err(|e| PacketSend.context(e))?;
+        Ok(())
+    }
+
+    pub(crate) async fn receive(&mut self, size: Option<usize>) -> GDResult<Vec<u8>> {
+        let mut buf: Vec<u8> = vec![0; size.unwrap_or(DEFAULT_PACKET_SIZE)];
+        let recv = self.socket.recv_from(&mut buf);
+        let result = match self.read_timeout {
+            Some(timeout) => {
+                ::tokio::time::timeout(timeout, recv)
+                    .await
+                    .map_err(|e| PacketReceive.context(e))?
+            }
+            None => recv.await,
+        };
+
+        let (number_of_bytes_received, _) = result.map_err(|e| PacketReceive.context(e))?;
+        buf.truncate(number_of_bytes_received);
+        Ok(buf)
+    }
+}
+
 #[cfg(not(feature = "packet_capture"))]
 pub type UdpSocket = UdpSocketImpl;
 #[cfg(not(feature = "packet_capture"))]
