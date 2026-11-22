@@ -20,7 +20,7 @@ use crate::{
     },
     socket::{Socket, UdpSocket},
     utils::{maybe_gather, retry_on_timeout, u8_lower_upper},
-    GDErrorKind::{BadGame, Decompress, UnknownEnumCast},
+    GDErrorKind::{BadGame, Decompress, PacketBad},
     GDResult,
 };
 
@@ -175,6 +175,49 @@ impl SplitPacket {
     }
 }
 
+/// Header of a challenge reply ('A').
+pub(super) const CHALLENGE_REPLY: u8 = 0x41;
+/// Header of the `A2S_INFO` reply in the Source format ('I').
+pub(super) const INFO_REPLY_SOURCE: u8 = 0x49;
+/// Header of the obsolete GoldSrc `A2S_INFO` reply ('m').
+pub(super) const INFO_REPLY_GOLDSRC: u8 = 0x6D;
+/// Datagrams read for one request (challenges and stray replies included)
+/// before giving up, so a misbehaving server cannot keep a query looping.
+pub(super) const MAX_REPLIES: usize = 8;
+
+/// What a received packet means for the request that is waiting for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Reply {
+    /// The server wants the request again with this challenge.
+    Challenge,
+    /// Left over from an earlier request: skip it and keep reading.
+    Stray,
+    /// The answer.
+    Answer,
+}
+
+/// Classify a packet of kind `reply` received for a request of kind
+/// `request`.
+///
+/// Older HLDS builds answer one `A2S_INFO` with two datagrams, the GoldSrc
+/// 'm' reply and then the Source 'I' one. The info query returns on the
+/// first, so the second can arrive while the player or rules request is
+/// waiting; it must not be taken for their answer.
+pub(super) fn classify_reply(request: u8, reply: u8) -> Reply {
+    const PLAYERS: u8 = Request::Players as u8;
+    const RULES: u8 = Request::Rules as u8;
+    match (request, reply) {
+        (_, CHALLENGE_REPLY) => Reply::Challenge,
+        (PLAYERS | RULES, INFO_REPLY_SOURCE | INFO_REPLY_GOLDSRC) => Reply::Stray,
+        _ => Reply::Answer,
+    }
+}
+
+/// The error when [MAX_REPLIES] datagrams came without an answer.
+pub(super) fn too_many_replies() -> crate::GDError {
+    PacketBad.context(format!("no answer in {MAX_REPLIES} replies"))
+}
+
 /// Build the request to resend after the server answered with a challenge
 /// (`0x41`, 'A').
 pub(super) fn challenge_request(kind: u8, challenge: Vec<u8>) -> Vec<u8> {
@@ -229,64 +272,60 @@ impl ValveProtocol {
         }
     }
 
-    pub fn get_kind_request_data(&mut self, engine: &Engine, protocol: u8, kind: Request) -> GDResult<Vec<u8>> {
-        let data = self.get_request_data(engine, protocol, kind as u8, kind.get_default_payload())?;
-        Ok(data)
+    fn get_kind_request_packet(&mut self, engine: &Engine, protocol: u8, kind: Request) -> GDResult<Packet> {
+        retry_on_timeout(self.retry_count, || {
+            self.get_request_packet(engine, protocol, kind as u8, kind.get_default_payload())
+        })
     }
 
     /// Ask for a specific request only.
     /// This function will retry fetch on timeouts.
     pub fn get_request_data(&mut self, engine: &Engine, protocol: u8, kind: u8, payload: Vec<u8>) -> GDResult<Vec<u8>> {
         retry_on_timeout(self.retry_count, || {
-            self.get_request_data_impl(engine, protocol, kind, payload.clone())
+            self.get_request_packet(engine, protocol, kind, payload.clone())
+                .map(|packet| packet.payload)
         })
     }
 
-    /// Ask for a specific request only (without retry logic).
-    fn get_request_data_impl(
-        &mut self,
-        engine: &Engine,
-        protocol: u8,
-        kind: u8,
-        payload: Vec<u8>,
-    ) -> GDResult<Vec<u8>> {
+    /// Ask for a specific request only (without retry logic), answering
+    /// challenges and skipping stray replies (see [classify_reply]).
+    fn get_request_packet(&mut self, engine: &Engine, protocol: u8, kind: u8, payload: Vec<u8>) -> GDResult<Packet> {
         let request_initial_packet = Packet::new(kind, payload).to_bytes();
         self.socket.send(&request_initial_packet)?;
 
-        let mut packet = self.receive(engine, protocol, PACKET_SIZE)?;
-        while packet.kind == 0x41 {
-            // 'A'
-            let challenge_packet = challenge_request(kind, packet.payload);
-
-            self.socket.send(&challenge_packet)?;
-
-            packet = self.receive(engine, protocol, PACKET_SIZE)?;
+        for _ in 0 .. MAX_REPLIES {
+            let packet = self.receive(engine, protocol, PACKET_SIZE)?;
+            match classify_reply(kind, packet.kind) {
+                Reply::Answer => return Ok(packet),
+                Reply::Stray => {}
+                Reply::Challenge => self.socket.send(&challenge_request(kind, packet.payload))?,
+            }
         }
 
-        Ok(packet.payload)
+        Err(too_many_replies())
     }
 
     /// Get the server information's.
     fn get_server_info(&mut self, engine: &Engine) -> GDResult<ServerInfo> {
-        let data = self.get_kind_request_data(engine, 0, Request::Info)?;
-        parse_server_info(engine, &data)
+        let packet = self.get_kind_request_packet(engine, 0, Request::Info)?;
+        parse_server_info(engine, packet.kind, &packet.payload)
     }
 
     /// Get the server player's.
     fn get_server_players(&mut self, engine: &Engine, protocol: u8) -> GDResult<Vec<ServerPlayer>> {
-        let data = self.get_kind_request_data(engine, protocol, Request::Players)?;
-        parse_server_players(engine, &data)
+        let packet = self.get_kind_request_packet(engine, protocol, Request::Players)?;
+        parse_server_players(engine, &packet.payload)
     }
 
     /// Get the server's rules.
     fn get_server_rules(&mut self, engine: &Engine, protocol: u8) -> GDResult<HashMap<String, String>> {
-        let data = self.get_kind_request_data(engine, protocol, Request::Rules)?;
-        parse_server_rules(engine, &data)
+        let packet = self.get_kind_request_packet(engine, protocol, Request::Rules)?;
+        parse_server_rules(engine, &packet.payload)
     }
 }
 
+/// Parse the obsolete GoldSrc `A2S_INFO` reply ('m'), header already read.
 fn parse_goldsrc_server_info(buffer: &mut Buffer<LittleEndian>) -> GDResult<ServerInfo> {
-    let _header: u8 = buffer.read()?; // get the header (useless info)
     let _address: String = buffer.read_string::<Utf8Decoder>(None)?; // get the server address (useless info)
     let name = buffer.read_string::<Utf8Decoder>(None)?;
     let map = buffer.read_string::<Utf8Decoder>(None)?;
@@ -295,17 +334,9 @@ fn parse_goldsrc_server_info(buffer: &mut Buffer<LittleEndian>) -> GDResult<Serv
     let players = buffer.read()?;
     let max_players = buffer.read()?;
     let protocol = buffer.read()?;
-    let server_type = match buffer.read::<u8>()? {
-        68 => Server::Dedicated,    //'D'
-        76 => Server::NonDedicated, //'L'
-        80 => Server::TV,           //'P'
-        _ => Err(UnknownEnumCast)?,
-    };
-    let environment_type = match buffer.read::<u8>()? {
-        76 => Environment::Linux,   //'L'
-        87 => Environment::Windows, //'W'
-        _ => Err(UnknownEnumCast)?,
-    };
+    // Documented upper case, but HLDS / ReHLDS send lower case ('d', 'l').
+    let server_type = Server::from_gldsrc(buffer.read()?)?;
+    let environment_type = Environment::from_gldsrc(buffer.read()?)?;
     let has_password = buffer.read::<u8>()? == 1;
     let is_mod = buffer.read::<u8>()? == 1;
     let mod_data = match is_mod {
@@ -314,7 +345,10 @@ fn parse_goldsrc_server_info(buffer: &mut Buffer<LittleEndian>) -> GDResult<Serv
             Some(ModData {
                 link: buffer.read_string::<Utf8Decoder>(None)?,
                 download_link: buffer.read_string::<Utf8Decoder>(None)?,
-                version: buffer.read()?,
+                version: {
+                    let _null: u8 = buffer.read()?; // a NULL byte before the version
+                    buffer.read()?
+                },
                 size: buffer.read()?,
                 multiplayer_only: buffer.read::<u8>()? == 1,
                 has_own_dll: buffer.read::<u8>()? == 1,
@@ -346,14 +380,20 @@ fn parse_goldsrc_server_info(buffer: &mut Buffer<LittleEndian>) -> GDResult<Serv
     })
 }
 
-/// Parse an `A2S_INFO` response payload.
-pub(super) fn parse_server_info(engine: &Engine, data: &[u8]) -> GDResult<ServerInfo> {
+/// Parse an `A2S_INFO` response payload; `kind` is the reply header, which
+/// picks the format: 'm' is the obsolete GoldSrc layout, 'I' the Source one
+/// (sent by GoldSrc servers too). Any other header falls back to the engine:
+/// GoldSrc layout when it is forced, else Source.
+pub(super) fn parse_server_info(engine: &Engine, kind: u8, data: &[u8]) -> GDResult<ServerInfo> {
     let mut buffer = Buffer::<LittleEndian>::new(data);
 
-    if let Engine::GoldSrc(force) = engine {
-        if *force {
-            return parse_goldsrc_server_info(&mut buffer);
-        }
+    let goldsrc_layout = match kind {
+        INFO_REPLY_GOLDSRC => true,
+        INFO_REPLY_SOURCE => false,
+        _ => *engine == Engine::GoldSrc(true),
+    };
+    if goldsrc_layout {
+        return parse_goldsrc_server_info(&mut buffer);
     }
 
     let protocol = buffer.read()?;
@@ -551,4 +591,113 @@ fn get_response(
             client.get_server_rules(&engine, protocol)
         ),
     })
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+
+    /// Captured from a hostsrc CS 1.6 server (81.181.244.29:27015,
+    /// 2026-11-22): it answers one `A2S_INFO` with these two datagrams, the
+    /// obsolete GoldSrc reply first.
+    pub(in crate::protocols::valve) const CAPTURED_INFO_GOLDSRC: &str = "ffffffff6d38312e3138312e3234342e32393a32373031350053657276657220686f7374617420646520484f53545352432e494f007a655f6a70345f726576657273650063737472696b65005a4f4d424945204553434150452044454c55584500020e2f646c00000100";
+    pub(in crate::protocols::valve) const CAPTURED_INFO_SOURCE: &str = "ffffffff493053657276657220686f7374617420646520484f53545352432e494f007a655f6a70345f726576657273650063737472696b65005a4f4d424945204553434150452044454c555845000a00020e00646c0001312e312e322e372f537464696f00808769";
+
+    pub(in crate::protocols::valve) fn unhex(hex: &str) -> Vec<u8> {
+        (0 .. hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i .. i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn parse_datagram(engine: Engine, hex: &str) -> GDResult<ServerInfo> {
+        let data = unhex(hex);
+        let packet = Packet::new_from_bufferer(&mut Buffer::<LittleEndian>::new(&data))?;
+        parse_server_info(&engine, packet.kind, &packet.payload)
+    }
+
+    /// The bug: with `GoldSrc(false)` the 'm' reply was parsed in the Source
+    /// layout (the address string became the name) and failed with
+    /// `UnknownEnumCast` on a byte of the hostname.
+    #[test]
+    fn goldsrc_info_reply_is_parsed_in_its_own_layout() {
+        for engine in [Engine::new_gold_src(false), Engine::new_gold_src(true), Engine::Source(None)] {
+            let info = parse_datagram(engine, CAPTURED_INFO_GOLDSRC).unwrap();
+            assert_eq!(info.name, "Server hostat de HOSTSRC.IO");
+            assert_eq!(info.map, "ze_jp4_reverse");
+            assert_eq!(info.folder, "cstrike");
+            assert_eq!(info.game_mode, "ZOMBIE ESCAPE DELUXE");
+            assert_eq!((info.players_online, info.players_maximum, info.players_bots), (2, 14, 0));
+            assert_eq!(info.protocol_version, 47);
+            assert_eq!(info.server_type, Server::Dedicated, "lower-case 'd'");
+            assert_eq!(info.environment_type, Environment::Linux, "lower-case 'l'");
+            assert!(!info.has_password);
+            assert!(info.vac_secured);
+            assert!(!info.is_mod);
+        }
+    }
+
+    #[test]
+    fn source_info_reply_from_the_same_server() {
+        for engine in [Engine::new_gold_src(false), Engine::new_gold_src(true)] {
+            let info = parse_datagram(engine, CAPTURED_INFO_SOURCE).unwrap();
+            assert_eq!(info.name, "Server hostat de HOSTSRC.IO");
+            assert_eq!(info.appid, 10);
+            assert_eq!(info.protocol_version, 48);
+            assert_eq!(info.game_version, "1.1.2.7/Stdio");
+            assert_eq!(info.extra_data.unwrap().port, Some(27015));
+        }
+    }
+
+    #[test]
+    fn goldsrc_mod_fields_skip_the_null_byte() {
+        let payload = [
+            &b"1.2.3.4:27015\0name\0map\0mymod\0My Mod\0"[..],
+            &[3, 16, 48, b'D', b'W', 1, 1],
+            b"http://mod\0http://dl\0",
+            &[0],
+            &7u32.to_le_bytes(),
+            &1234u32.to_le_bytes(),
+            &[1, 1, 1, 2],
+        ]
+        .concat();
+        let info = parse_server_info(&Engine::new_gold_src(false), INFO_REPLY_GOLDSRC, &payload).unwrap();
+        let mod_data = info.mod_data.unwrap();
+        assert_eq!((mod_data.version, mod_data.size), (7, 1234));
+        assert!(mod_data.multiplayer_only && mod_data.has_own_dll);
+        assert!(info.vac_secured);
+        assert_eq!(info.players_bots, 2);
+        assert_eq!(info.environment_type, Environment::Windows);
+    }
+
+    #[test]
+    fn unknown_server_type_and_environment_are_kept() {
+        let mut data = unhex(CAPTURED_INFO_SOURCE);
+        // server type and environment follow players, max players and bots.
+        let at = data.windows(3).position(|w| w == [2, 14, 0]).unwrap() + 3;
+        data[at] = b'x';
+        data[at + 1] = 0;
+        let packet = Packet::new_from_bufferer(&mut Buffer::<LittleEndian>::new(&data)).unwrap();
+        let info = parse_server_info(&Engine::new_gold_src(false), packet.kind, &packet.payload).unwrap();
+        assert_eq!(info.server_type, Server::Unknown(b'x'));
+        assert_eq!(info.environment_type, Environment::Unknown(0));
+        assert_eq!(info.game_version, "1.1.2.7/Stdio");
+    }
+
+    #[test]
+    fn late_info_replies_are_not_taken_for_players_or_rules() {
+        let (info, players, rules) = (Request::Info as u8, Request::Players as u8, Request::Rules as u8);
+        for request in [info, players, rules] {
+            assert_eq!(classify_reply(request, CHALLENGE_REPLY), Reply::Challenge);
+        }
+        for late in [INFO_REPLY_SOURCE, INFO_REPLY_GOLDSRC] {
+            assert_eq!(classify_reply(info, late), Reply::Answer);
+            assert_eq!(classify_reply(players, late), Reply::Stray);
+            assert_eq!(classify_reply(rules, late), Reply::Stray);
+        }
+        assert_eq!(classify_reply(players, 0x44), Reply::Answer);
+        assert_eq!(classify_reply(rules, 0x45), Reply::Answer);
+        // Other request kinds (e.g. FFOW's 0x46) keep taking any reply.
+        assert_eq!(classify_reply(0x46, INFO_REPLY_SOURCE), Reply::Answer);
+    }
 }

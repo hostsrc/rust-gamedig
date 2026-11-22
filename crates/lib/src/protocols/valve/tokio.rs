@@ -22,11 +22,15 @@
 use super::protocol::{
     challenge_request,
     check_app_id,
+    classify_reply,
     parse_server_info,
     parse_server_players,
     parse_server_rules,
+    too_many_replies,
     FirstPacket,
+    Reply,
     SplitPacket,
+    MAX_REPLIES,
     PACKET_SIZE,
 };
 use crate::{
@@ -81,25 +85,14 @@ impl AsyncValveProtocol {
         }
     }
 
-    async fn get_kind_request_data(&mut self, engine: &Engine, protocol: u8, kind: Request) -> GDResult<Vec<u8>> {
-        self.get_request_data(engine, protocol, kind as u8, kind.get_default_payload())
-            .await
-    }
-
     /// Ask for a specific request only, retrying on send/receive failures
     /// (including timeouts) like the blocking `retry_on_timeout`.
-    async fn get_request_data(
-        &mut self,
-        engine: &Engine,
-        protocol: u8,
-        kind: u8,
-        payload: Vec<u8>,
-    ) -> GDResult<Vec<u8>> {
+    async fn get_kind_request_packet(&mut self, engine: &Engine, protocol: u8, kind: Request) -> GDResult<Packet> {
         let mut last_err = PacketReceive.context("Retry count was 0");
 
         for _ in 0 ..= self.retry_count {
             last_err = match self
-                .get_request_data_impl(engine, protocol, kind, payload.clone())
+                .get_request_packet(engine, protocol, kind as u8, kind.get_default_payload())
                 .await
             {
                 Ok(r) => return Ok(r),
@@ -111,47 +104,45 @@ impl AsyncValveProtocol {
         Err(last_err)
     }
 
-    /// Ask for a specific request only (without retry logic).
-    async fn get_request_data_impl(
-        &mut self,
-        engine: &Engine,
-        protocol: u8,
-        kind: u8,
-        payload: Vec<u8>,
-    ) -> GDResult<Vec<u8>> {
+    /// Ask for a specific request only (without retry logic), answering
+    /// challenges and skipping stray replies like the blocking client.
+    async fn get_request_packet(&mut self, engine: &Engine, protocol: u8, kind: u8, payload: Vec<u8>) -> GDResult<Packet> {
         let request_initial_packet = Packet::new(kind, payload).to_bytes();
         self.socket.send(&request_initial_packet).await?;
 
-        let mut packet = self.receive(engine, protocol, PACKET_SIZE).await?;
-        while packet.kind == 0x41 {
-            // 'A'
-            let challenge_packet = challenge_request(kind, packet.payload);
-
-            self.socket.send(&challenge_packet).await?;
-
-            packet = self.receive(engine, protocol, PACKET_SIZE).await?;
+        for _ in 0 .. MAX_REPLIES {
+            let packet = self.receive(engine, protocol, PACKET_SIZE).await?;
+            match classify_reply(kind, packet.kind) {
+                Reply::Answer => return Ok(packet),
+                Reply::Stray => {}
+                Reply::Challenge => {
+                    self.socket
+                        .send(&challenge_request(kind, packet.payload))
+                        .await?
+                }
+            }
         }
 
-        Ok(packet.payload)
+        Err(too_many_replies())
     }
 
     async fn get_server_info(&mut self, engine: &Engine) -> GDResult<ServerInfo> {
-        let data = self.get_kind_request_data(engine, 0, Request::Info).await?;
-        parse_server_info(engine, &data)
+        let packet = self.get_kind_request_packet(engine, 0, Request::Info).await?;
+        parse_server_info(engine, packet.kind, &packet.payload)
     }
 
     async fn get_server_players(&mut self, engine: &Engine, protocol: u8) -> GDResult<Vec<ServerPlayer>> {
-        let data = self
-            .get_kind_request_data(engine, protocol, Request::Players)
+        let packet = self
+            .get_kind_request_packet(engine, protocol, Request::Players)
             .await?;
-        parse_server_players(engine, &data)
+        parse_server_players(engine, &packet.payload)
     }
 
     async fn get_server_rules(&mut self, engine: &Engine, protocol: u8) -> GDResult<HashMap<String, String>> {
-        let data = self
-            .get_kind_request_data(engine, protocol, Request::Rules)
+        let packet = self
+            .get_kind_request_packet(engine, protocol, Request::Rules)
             .await?;
-        parse_server_rules(engine, &data)
+        parse_server_rules(engine, &packet.payload)
     }
 }
 
@@ -443,6 +434,60 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.kind, crate::GDErrorKind::BadGame);
+    }
+
+    /// Regression (hostsrc servers, "UnknownEnumCast"): the server answers
+    /// `A2S_INFO` with the GoldSrc 'm' reply and then the Source 'I' one
+    /// (captured bytes). The info comes from the first, and the second must
+    /// not be read as the answer to the players request that follows.
+    #[::tokio::test(flavor = "multi_thread")]
+    async fn double_info_reply_from_hlds() {
+        use crate::protocols::valve::protocol::tests::{unhex, CAPTURED_INFO_GOLDSRC, CAPTURED_INFO_SOURCE};
+
+        let server = ::tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let challenge = [0x12, 0x34, 0x56, 0x78];
+        ::tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+                let req = &buf[.. n];
+                let replies = match req[4] {
+                    0x54 => vec![unhex(CAPTURED_INFO_GOLDSRC), unhex(CAPTURED_INFO_SOURCE)],
+                    0x55 | 0x56 if !req.ends_with(&challenge) => vec![[&SIMPLE[..], &[0x41], &challenge].concat()],
+                    0x55 => vec![[&SIMPLE[..], &players_payload()].concat()],
+                    0x56 => vec![[&SIMPLE[..], &rules_payload()].concat()],
+                    _ => vec![],
+                };
+                for reply in replies {
+                    server.send_to(&reply, peer).await.unwrap();
+                }
+            }
+        });
+
+        let gather = GatheringSettings {
+            players: GatherToggle::Enforce,
+            rules: GatherToggle::Enforce,
+            check_app_id: false,
+        };
+        let engine = Engine::new_gold_src(false);
+        let response = query(&address, engine, Some(gather), timeouts(0))
+            .await
+            .unwrap();
+        assert_eq!(response.info.name, "Server hostat de HOSTSRC.IO");
+        assert_eq!(response.info.map, "ze_jp4_reverse");
+        assert_eq!(response.info.players_online, 2);
+        let players = response.players.as_ref().unwrap();
+        assert_eq!(players.len(), 2);
+        assert_eq!(players[0].name, "alice");
+        assert_eq!(response.rules.as_ref().unwrap()["sv_gravity"], "800");
+
+        let blocking =
+            ::tokio::task::spawn_blocking(move || super::super::query(&address, engine, Some(gather), timeouts(0)))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(blocking, response);
     }
 
     #[test]

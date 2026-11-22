@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use crate::protocols::types::{CommonPlayer, CommonResponse, ExtraRequestSettings, GatherToggle, GenericPlayer};
-use crate::GDErrorKind::UnknownEnumCast;
 use crate::GDResult;
 use crate::{buffer::Buffer, protocols::GenericResponse};
 use byteorder::LittleEndian;
@@ -15,15 +14,20 @@ pub enum Server {
     Dedicated,
     NonDedicated,
     TV,
+    /// A byte no known server sends; kept so one odd field does not fail
+    /// the whole query.
+    Unknown(u8),
 }
 
 impl Server {
+    /// Parse the server type byte of either `A2S_INFO` reply format, in any
+    /// case (GoldSrc servers send both 'D' and 'd').
     pub(crate) fn from_gldsrc(value: u8) -> GDResult<Self> {
         Ok(match value.to_ascii_lowercase() {
             100 => Self::Dedicated,    //'d'
             108 => Self::NonDedicated, //'l'
             112 => Self::TV,           //'p'
-            _ => Err(UnknownEnumCast)?,
+            _ => Self::Unknown(value),
         })
     }
 }
@@ -35,15 +39,20 @@ pub enum Environment {
     Linux,
     Windows,
     Mac,
+    /// A byte no known server sends; kept so one odd field does not fail
+    /// the whole query.
+    Unknown(u8),
 }
 
 impl Environment {
+    /// Parse the environment byte of either `A2S_INFO` reply format, in any
+    /// case (GoldSrc servers send both 'L' and 'l').
     pub(crate) fn from_gldsrc(value: u8) -> GDResult<Self> {
         Ok(match value.to_ascii_lowercase() {
             108 => Self::Linux,     //'l'
             119 => Self::Windows,   //'w'
             109 | 111 => Self::Mac, //'m' or 'o'
-            _ => Err(UnknownEnumCast)?,
+            _ => Self::Unknown(value),
         })
     }
 }
