@@ -1,11 +1,12 @@
 use crate::{
     protocols::types::TimeoutSettings,
+    utils::{read_to_end_capped, MAX_STREAM_RESPONSE},
     GDErrorKind::{PacketReceive, PacketSend, SocketBind, SocketConnect},
     GDResult,
 };
 
 use std::{
-    io::{Read, Write},
+    io::Write,
     net::{self, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
@@ -117,13 +118,15 @@ impl Socket for TcpSocketImpl {
         Ok(())
     }
 
+    /// Read until the server closes the connection, at most
+    /// [MAX_STREAM_RESPONSE] bytes: a longer reply is a
+    /// [PacketOverflow](crate::GDErrorKind::PacketOverflow) error.
     fn receive(&mut self, size: Option<usize>) -> GDResult<Vec<u8>> {
-        let mut buf = Vec::with_capacity(size.unwrap_or(1024));
-        self.socket
-            .read_to_end(&mut buf)
-            .map_err(|e| PacketReceive.context(e))?;
-
-        Ok(buf)
+        read_to_end_capped(
+            &mut self.socket,
+            size.unwrap_or(4096), // initial capacity only
+            MAX_STREAM_RESPONSE,
+        )
     }
 
     fn port(&self) -> u16 { self.address.port() }
@@ -347,6 +350,9 @@ mod tests {
         assert_eq!(message, &received_message[..]);
     }
 
+    /// The cap on TCP replies.
+    const ONE_MIB: usize = 1024 * 1024;
+
     fn short_timeouts() -> Option<TimeoutSettings> {
         TimeoutSettings::new(
             Some(std::time::Duration::from_secs(2)),
@@ -437,6 +443,39 @@ mod tests {
         socket.send(b"request").unwrap();
         assert_eq!(socket.receive(None).unwrap(), expected);
         assert_eq!(socket.receive(Some(16)).unwrap(), expected);
+        server_thread.join().unwrap();
+    }
+
+    /// A TCP server that sends `length` bytes and closes.
+    fn tcp_server_sending(length: usize) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // The client stops reading after the cap; ignore the broken pipe.
+            let _ = stream.write_all(&vec![b'x'; length]);
+        });
+        (address, handle)
+    }
+
+    /// A TCP reply used to be read to the end with no limit.
+    #[test]
+    fn tcp_reply_over_1_mib_is_an_overflow_error() {
+        let (address, server_thread) = tcp_server_sending(ONE_MIB + 1);
+
+        let mut socket = TcpSocket::new(&address, &short_timeouts()).unwrap();
+        let error = socket.receive(None).unwrap_err();
+        assert_eq!(error.kind, crate::GDErrorKind::PacketOverflow);
+        drop(socket);
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_reply_of_exactly_1_mib_is_read() {
+        let (address, server_thread) = tcp_server_sending(ONE_MIB);
+
+        let mut socket = TcpSocket::new(&address, &short_timeouts()).unwrap();
+        assert_eq!(socket.receive(None).unwrap().len(), ONE_MIB);
         server_thread.join().unwrap();
     }
 

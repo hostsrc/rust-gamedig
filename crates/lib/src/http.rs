@@ -7,19 +7,40 @@
 // TODO: When this is used in more places remove this and refine the interface.
 #![allow(dead_code)]
 
-use crate::GDErrorKind::{HostLookup, InvalidInput, PacketReceive, PacketSend, ProtocolFormat};
+use crate::utils::{read_to_end_capped, MAX_STREAM_RESPONSE};
+use crate::GDErrorKind::{HostLookup, InvalidInput, PacketSend, ProtocolFormat};
 use crate::{GDResult, TimeoutSettings};
 
-use std::io::Read;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 
-use ureq::{Agent, AgentBuilder, Request};
+use ureq::{Agent, AgentBuilder, Request, Response};
 use url::{Host, Url};
 
 use serde::{de::DeserializeOwned, Serialize};
 
-/// Max length of HTTP responses in bytes: 1GB
-const MAX_RESPONSE_LENGTH: usize = 1024 * 1024 * 1024;
+/// Max length of HTTP response bodies in bytes: 1 MiB. A longer body is a
+/// [PacketOverflow](crate::GDErrorKind::PacketOverflow) error.
+const MAX_RESPONSE_LENGTH: usize = MAX_STREAM_RESPONSE;
+
+/// Read a response body, at most [MAX_RESPONSE_LENGTH] bytes.
+fn read_body(http_response: Response) -> GDResult<Vec<u8>> {
+    let length = match http_response.header("Content-Length") {
+        Some(length) => {
+            length
+                .parse::<usize>()
+                .map_err(|e| ProtocolFormat.context(e))?
+        }
+        None => 5012, // Sensible default allocation
+    };
+
+    read_to_end_capped(http_response.into_reader(), length, MAX_RESPONSE_LENGTH)
+}
+
+/// Read a response body (capped as [read_body]) and parse it as JSON.
+fn read_json<T: DeserializeOwned>(http_response: Response) -> GDResult<T> {
+    let body = read_body(http_response)?;
+    serde_json::from_slice(&body).map_err(|e| ProtocolFormat.context(e))
+}
 
 /// HTTP request client. Define parameters host parameters on new, then re-use
 /// for each request.
@@ -290,24 +311,7 @@ impl HttpClient {
         // Send the request.
         let http_response = request.call().map_err(|e| PacketSend.context(e))?;
 
-        let length = if let Some(length) = http_response.header("Content-Length") {
-            length
-                .parse::<usize>()
-                .map_err(|e| ProtocolFormat.context(e))?
-                .min(MAX_RESPONSE_LENGTH)
-        } else {
-            5012 // Sensible default allocation
-        };
-
-        let mut buffer: Vec<u8> = Vec::with_capacity(length);
-
-        let _ = http_response
-            .into_reader()
-            .take(MAX_RESPONSE_LENGTH as u64)
-            .read_to_end(&mut buffer)
-            .map_err(|e| PacketReceive.context(e))?;
-
-        Ok(buffer)
+        read_body(http_response)
     }
 
     /// Send a HTTP request without any data and parse the JSON response.
@@ -318,11 +322,7 @@ impl HttpClient {
         let request = self.make_request(method, headers);
 
         // Send the request and parse the response as JSON.
-        request
-            .call()
-            .map_err(|e| PacketSend.context(e))?
-            .into_json::<T>()
-            .map_err(|e| ProtocolFormat.context(e))
+        read_json(request.call().map_err(|e| PacketSend.context(e))?)
     }
 
     /// Send a HTTP request with JSON data and parse the JSON response.
@@ -337,11 +337,7 @@ impl HttpClient {
         self.address.set_path(path);
         let request = self.make_request(method, headers);
 
-        request
-            .send_json(data)
-            .map_err(|e| PacketSend.context(e))?
-            .into_json::<T>()
-            .map_err(|e| ProtocolFormat.context(e))
+        read_json(request.send_json(data).map_err(|e| PacketSend.context(e))?)
     }
 
     /// Send a HTTP request with FORM data and parse the JSON response.
@@ -356,11 +352,7 @@ impl HttpClient {
         self.address.set_path(path);
         let request = self.make_request(method, headers);
 
-        request
-            .send_form(data)
-            .map_err(|e| PacketSend.context(e))?
-            .into_json::<T>()
-            .map_err(|e| ProtocolFormat.context(e))
+        read_json(request.send_form(data).map_err(|e| PacketSend.context(e))?)
     }
 }
 
@@ -389,6 +381,66 @@ mod tests {
         assert_eq!(settings.hostname, Some(HOSTNAME));
         assert_eq!(settings.protocol, PROTOCOL);
         assert_eq!(settings.headers, vec![("Foo", "bar"), ("Baz", "Buzz"),]);
+    }
+
+    /// The cap on HTTP bodies.
+    const ONE_MIB: usize = 1024 * 1024;
+
+    /// A loopback HTTP server answering one request with a `body_length`-byte
+    /// body, with or without a Content-Length header.
+    fn http_server(body_length: usize, content_length: bool) -> SocketAddr {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            let header = if content_length {
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {body_length}\r\nConnection: close\r\n\r\n")
+            } else {
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string()
+            };
+            let _ = stream.write_all(header.as_bytes());
+            // The client stops reading after the cap; ignore the broken pipe.
+            let _ = stream.write_all(&vec![b'x'; body_length]);
+        });
+        address
+    }
+
+    /// HTTP bodies used to be read up to 1 GB and silently cut there.
+    #[test]
+    fn http_body_over_1_mib_is_an_overflow_error() {
+        for content_length in [true, false] {
+            let address = http_server(ONE_MIB + 1, content_length);
+            let mut client = HttpClient::new(&address, &None, HttpSettings::<String>::default()).unwrap();
+
+            let error = client.get("/", None).unwrap_err();
+            assert_eq!(
+                error.kind,
+                crate::GDErrorKind::PacketOverflow,
+                "content_length {content_length}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_body_up_to_1_mib_is_read() {
+        let address = http_server(ONE_MIB, true);
+        let mut client = HttpClient::new(&address, &None, HttpSettings::<String>::default()).unwrap();
+
+        assert_eq!(client.get("/", None).unwrap().len(), ONE_MIB);
+    }
+
+    /// JSON requests go through the same cap.
+    #[test]
+    fn http_json_body_over_1_mib_is_an_overflow_error() {
+        let address = http_server(ONE_MIB + 1, true);
+        let mut client = HttpClient::new(&address, &None, HttpSettings::<String>::default()).unwrap();
+
+        let error = client.get_json::<serde_json::Value>("/", None).unwrap_err();
+        assert_eq!(error.kind, crate::GDErrorKind::PacketOverflow);
     }
 
     #[test]

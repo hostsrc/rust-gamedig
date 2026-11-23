@@ -1,6 +1,29 @@
 use crate::GDErrorKind::{PacketOverflow, PacketReceive, PacketSend, PacketUnderflow};
 use crate::GDResult;
 use std::cmp::Ordering;
+use std::io::Read;
+
+/// Most bytes read from one TCP or HTTP reply: 1 MiB. Every reply comes from a
+/// server we don't control, so a longer one is refused rather than buffered.
+pub(crate) const MAX_STREAM_RESPONSE: usize = 1024 * 1024;
+
+/// Read `reader` to the end, but at most `limit` bytes. A longer stream is a
+/// [PacketOverflow] error (no more than `limit + 1` bytes are buffered); a read
+/// error is [PacketReceive]. `capacity` is the initial allocation, clamped to
+/// `limit`.
+pub(crate) fn read_to_end_capped<R: Read>(reader: R, capacity: usize, limit: usize) -> GDResult<Vec<u8>> {
+    let mut buffer = Vec::with_capacity(capacity.min(limit));
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut buffer)
+        .map_err(|e| PacketReceive.context(e))?;
+
+    if buffer.len() > limit {
+        return Err(PacketOverflow.context(format!("Reply is longer than {limit} bytes")));
+    }
+
+    Ok(buffer)
+}
 
 pub fn error_by_expected_size(expected: usize, size: usize) -> GDResult<()> {
     match size.cmp(&expected) {
