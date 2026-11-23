@@ -1,12 +1,12 @@
 use crate::{
     protocols::types::TimeoutSettings,
     utils::{read_to_end_capped, MAX_STREAM_RESPONSE},
-    GDErrorKind::{PacketReceive, PacketSend, SocketBind, SocketConnect},
+    GDErrorKind::{PacketOverflow, PacketReceive, PacketSend, SocketBind, SocketConnect},
     GDResult,
 };
 
 use std::{
-    io::Write,
+    io::{Read, Write},
     net::{self, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
@@ -65,6 +65,15 @@ pub trait Socket {
     /// # Returns
     /// A result containing received data or an error.
     fn receive(&mut self, size: Option<usize>) -> GDResult<Vec<u8>>;
+
+    /// Receive exactly `len` bytes, for protocols that frame their replies on
+    /// a stream (Minecraft Java's length prefix), so the reader never waits
+    /// for the server to close the connection. A stream socket implements
+    /// it; on a datagram socket it is an error.
+    fn receive_exact(&mut self, len: usize) -> GDResult<Vec<u8>> {
+        let _ = len;
+        Err(PacketReceive.context("receive_exact needs a stream socket"))
+    }
 
     /// Get the remote port of the socket.
     ///
@@ -127,6 +136,22 @@ impl Socket for TcpSocketImpl {
             size.unwrap_or(4096), // initial capacity only
             MAX_STREAM_RESPONSE,
         )
+    }
+
+    /// Read exactly `len` bytes, at most [MAX_STREAM_RESPONSE]: a longer
+    /// length is a [PacketOverflow](crate::GDErrorKind::PacketOverflow) error
+    /// before anything is allocated.
+    fn receive_exact(&mut self, len: usize) -> GDResult<Vec<u8>> {
+        if len > MAX_STREAM_RESPONSE {
+            return Err(PacketOverflow.context(format!(
+                "Reply is longer than {MAX_STREAM_RESPONSE} bytes"
+            )));
+        }
+        let mut buffer = vec![0; len];
+        self.socket
+            .read_exact(&mut buffer)
+            .map_err(|e| PacketReceive.context(e))?;
+        Ok(buffer)
     }
 
     fn port(&self) -> u16 { self.address.port() }

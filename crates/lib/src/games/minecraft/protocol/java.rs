@@ -3,7 +3,7 @@ use crate::{
     games::minecraft::{as_string, as_varint, get_string, get_varint, JavaResponse, Player, RequestSettings, Server},
     protocols::types::TimeoutSettings,
     socket::{Socket, TcpSocket},
-    utils::retry_on_timeout,
+    utils::{retry_on_timeout, MAX_STREAM_RESPONSE},
     GDErrorKind::{JsonParse, PacketBad},
     GDResult,
 };
@@ -11,7 +11,6 @@ use crate::{
 use byteorder::LittleEndian;
 use serde_json::Value;
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Java {
     socket: TcpSocket,
@@ -40,15 +39,24 @@ impl Java {
             .send(&[as_varint(data.len() as i32), data].concat())
     }
 
+    /// Read one packet by its frame: the VarInt length, then exactly that many
+    /// bytes (at most [MAX_STREAM_RESPONSE]). After the status reply the
+    /// server keeps the connection open, so reading until it closes would
+    /// wait for the timeout and lose the reply.
     fn receive(&mut self) -> GDResult<Vec<u8>> {
-        let data = &self.socket.receive(None)?;
-        let mut buffer = Buffer::<LittleEndian>::new(data);
-
-        let _packet_length = get_varint(&mut buffer)? as usize;
-        // this declared 'packet length' from within the packet might be wrong (?), not
-        // checking with it...
-
-        Ok(buffer.remaining_bytes().to_vec())
+        let mut length: u32 = 0;
+        for i in 0 .. 5 {
+            let byte = self.socket.receive_exact(1)?[0];
+            length |= u32::from(byte & 0x7f) << (7 * i);
+            if byte & 0x80 == 0 {
+                let length = length as usize;
+                if length == 0 || length > MAX_STREAM_RESPONSE {
+                    return Err(PacketBad.context(format!("Bad packet length {length}")));
+                }
+                return self.socket.receive_exact(length);
+            }
+        }
+        Err(PacketBad.context("Packet length is longer than 5 bytes"))
     }
 
     fn send_handshake(&mut self) -> GDResult<()> {
@@ -60,8 +68,8 @@ impl Java {
             as_varint(self.request_settings.protocol_version).as_slice(),
             // Server address (can be anything)
             as_string(&self.request_settings.hostname)?.as_slice(),
-            // Server port (can be anything)
-            &self.socket.port().to_le_bytes(),
+            // Server port (unsigned short, big-endian like every protocol number)
+            &self.socket.port().to_be_bytes(),
             &[
                 // Next state (1 for status)
                 0x01,
@@ -83,20 +91,6 @@ impl Java {
         Ok(())
     }
 
-    fn send_ping_request(&mut self) -> GDResult<()> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-
-        let mut payload = [0x01].to_vec(); // Packet ID (1)
-        payload.extend_from_slice(&timestamp.to_be_bytes()); // Timestamp (long, 8 bytes)
-
-        self.send(payload)?;
-
-        Ok(())
-    }
-
     /// Send minecraft ping request and parse the response.
     /// This function will retry fetch on timeouts.
     fn get_info(&mut self) -> GDResult<JavaResponse> {
@@ -106,9 +100,11 @@ impl Java {
     /// Send minecraft ping request and parse the response (without retry
     /// logic).
     fn get_info_impl(&mut self) -> GDResult<JavaResponse> {
+        // No ping before the status reply: proxies such as Velocity answer a
+        // ping sent that early with something other than the status, and the
+        // pong isn't used.
         self.send_handshake()?;
         self.send_status_request()?;
-        self.send_ping_request()?;
 
         let socket_data = self.receive()?;
         let mut buffer = Buffer::<LittleEndian>::new(&socket_data);
@@ -174,5 +170,108 @@ impl Java {
         request_settings: Option<RequestSettings>,
     ) -> GDResult<JavaResponse> {
         Self::new(address, timeout_settings, request_settings)?.get_info()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn varint(value: i32) -> Vec<u8> { as_varint(value) }
+
+    fn frame(body: &[u8]) -> Vec<u8> { [varint(body.len() as i32), body.to_vec()].concat() }
+
+    const STATUS: &str = r#"{"version":{"name":"1.21.4","protocol":769},"players":{"max":100,"online":12},"description":{"text":"hi"}}"#;
+
+    fn status_reply() -> Vec<u8> {
+        let json = STATUS.as_bytes();
+        frame(&[vec![0x00], varint(json.len() as i32), json.to_vec()].concat())
+    }
+
+    /// A server that reads what the client sends for 300 ms, writes `reply`
+    /// in two chunks, then keeps the connection open for 3 s (as Minecraft
+    /// servers do, waiting for a ping). Returns its address and what the
+    /// client sent.
+    fn fake(reply: Vec<u8>) -> (SocketAddr, mpsc::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sent, seen) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while let Ok(n) = stream.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[.. n]);
+            }
+            sent.send(request).unwrap();
+            let half = reply.len() / 2;
+            let _ = stream.write_all(&reply[.. half]);
+            thread::sleep(Duration::from_millis(50));
+            let _ = stream.write_all(&reply[half ..]);
+            thread::sleep(Duration::from_secs(3));
+        });
+        (addr, seen)
+    }
+
+    fn timeouts() -> Option<TimeoutSettings> {
+        Some(TimeoutSettings::new(Some(Duration::from_secs(2)), Some(Duration::from_secs(2)), None, 0).unwrap())
+    }
+
+    #[test]
+    fn the_status_is_read_by_its_frame_while_the_server_keeps_the_connection_open() {
+        let (addr, seen) = fake(status_reply());
+        let started = Instant::now();
+        let response = Java::query(&addr, timeouts(), None).unwrap();
+        // Well under the 2 s read timeout: nothing waited for the server to close.
+        assert!(started.elapsed() < Duration::from_millis(1500), "{:?}", started.elapsed());
+        assert_eq!((response.players_online, response.players_maximum), (12, 100));
+        assert_eq!(response.game_version, "1.21.4");
+
+        // What the client sent: the handshake and the status request, no ping.
+        let request = seen.recv().unwrap();
+        let mut buffer = Buffer::<LittleEndian>::new(&request);
+        let mut frames = Vec::new();
+        while buffer.remaining_length() > 0 {
+            let length = get_varint(&mut buffer).unwrap() as usize;
+            frames.push(buffer.remaining_bytes()[.. length].to_vec());
+            buffer.move_cursor(length as isize).unwrap();
+        }
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(frames[1], [0x00]);
+        // The handshake ends with the port, big-endian, then next state 1.
+        let handshake = &frames[0];
+        assert_eq!(handshake[0], 0x00);
+        let port = addr.port().to_be_bytes();
+        assert_eq!(&handshake[handshake.len() - 3 ..], &[port[0], port[1], 0x01]);
+    }
+
+    #[test]
+    fn a_huge_declared_length_is_refused_before_anything_is_allocated() {
+        let (addr, _seen) = fake(varint(i32::MAX));
+        let error = Java::query(&addr, timeouts(), None).unwrap_err();
+        assert_eq!(error.kind, PacketBad, "{error:?}");
+    }
+
+    #[test]
+    fn a_reply_cut_short_is_an_error_not_a_wait() {
+        let full = status_reply();
+        let short = full[.. full.len() - 10].to_vec();
+        // The fake keeps the connection open after the short reply, so the
+        // read ends at the 2 s timeout with an error, never with a result.
+        let (addr, _seen) = fake(short);
+        assert!(Java::query(&addr, timeouts(), None).is_err());
     }
 }

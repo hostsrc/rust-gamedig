@@ -144,6 +144,23 @@ impl<I: Socket, P: ProtocolProvider> Socket for WrappedCaptureSocket<I, P> {
         Ok(data)
     }
 
+    /// Receives exactly `len` bytes from the inner socket and captures them.
+    fn receive_exact(&mut self, len: usize) -> crate::GDResult<Vec<u8>> {
+        let data = self.inner.receive_exact(len)?;
+        let info = CapturePacket {
+            direction: Direction::Receive,
+            protocol: P::protocol(),
+            remote_address: &self.remote_address,
+            local_address: &self.local_addr().unwrap(),
+        };
+
+        if let Some(writer) = CAPTURE_WRITER.lock().unwrap().as_mut() {
+            writer.write(&info, &data)?;
+        }
+
+        Ok(data)
+    }
+
     /// Applies timeout settings to the wrapped socket.
     ///
     /// Delegates the operation to the inner socket implementation.
