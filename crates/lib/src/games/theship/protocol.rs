@@ -21,3 +21,6 @@ pub fn query_with_timeout(
 
     Response::new_from_valve_response(valve_response)
 }
+
+#[cfg(test)]
+mod hostile_tests;

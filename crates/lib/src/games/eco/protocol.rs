@@ -35,3 +35,6 @@ pub fn query_with_timeout_and_extra_settings(
 
     Ok(response.into())
 }
+
+#[cfg(test)]
+mod hostile_tests;

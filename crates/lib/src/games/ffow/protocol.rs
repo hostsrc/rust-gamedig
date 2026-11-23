@@ -64,3 +64,6 @@ pub fn query_with_timeout(
         time_left,
     })
 }
+
+#[cfg(test)]
+mod hostile_tests;

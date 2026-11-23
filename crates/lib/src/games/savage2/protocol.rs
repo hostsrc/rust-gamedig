@@ -35,3 +35,6 @@ pub fn query_with_timeout(
         level_minimum: buffer.read::<u8>()?,
     })
 }
+
+#[cfg(test)]
+mod hostile_tests;

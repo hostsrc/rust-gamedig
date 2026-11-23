@@ -56,3 +56,6 @@ pub fn query_with_retries(address: &SocketAddr, timeout_settings: &Option<Timeou
 
     utils::retry_on_timeout(retries, || query(address, timeout_settings))
 }
+
+#[cfg(test)]
+mod hostile_tests;
