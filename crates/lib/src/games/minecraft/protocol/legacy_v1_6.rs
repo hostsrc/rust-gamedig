@@ -100,8 +100,9 @@ impl LegacyV1_6 {
             return Err(ProtocolFormat.context("Expected 0xFF"));
         }
 
-        let length = buffer.read::<u16>()? * 2;
-        error_by_expected_size((length + 3) as usize, data.len())?;
+        // The length is in UTF-16 units; in usize so `* 2 + 3` can't overflow.
+        let length = usize::from(buffer.read::<u16>()?) * 2;
+        error_by_expected_size(length + 3, data.len())?;
 
         if !Self::is_protocol(&mut buffer)? {
             return Err(ProtocolFormat.context("Not legacy 1.6 protocol"));

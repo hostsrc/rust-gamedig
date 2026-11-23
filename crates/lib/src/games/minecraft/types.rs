@@ -8,7 +8,7 @@ use crate::{
         types::{CommonPlayer, CommonResponse, ExtraRequestSettings, GenericPlayer},
         GenericResponse,
     },
-    GDErrorKind::{InvalidInput, PacketBad, UnknownEnumCast},
+    GDErrorKind::{InvalidInput, PacketBad, PacketUnderflow, UnknownEnumCast},
     GDResult,
 };
 
@@ -274,7 +274,15 @@ pub(crate) fn as_varint(value: i32) -> Vec<u8> {
 }
 
 pub(crate) fn get_string<B: ByteOrder>(buffer: &mut Buffer<B>) -> GDResult<String> {
-    let length = get_varint(buffer)? as usize;
+    // The length comes from the server: a negative one, or one longer than the
+    // rest of the reply, is an error rather than an allocation of that size.
+    let length = usize::try_from(get_varint(buffer)?).map_err(|e| PacketBad.context(e))?;
+    if length > buffer.remaining_length() {
+        return Err(PacketUnderflow.context(format!(
+            "String length {length} is longer than the {} bytes left",
+            buffer.remaining_length()
+        )));
+    }
     let mut text = Vec::with_capacity(length);
 
     for _ in 0 .. length {

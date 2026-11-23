@@ -89,3 +89,6 @@ pub fn query_legacy_specific(
 pub fn query_bedrock(address: &SocketAddr, timeout_settings: Option<TimeoutSettings>) -> GDResult<BedrockResponse> {
     Bedrock::query(address, timeout_settings)
 }
+
+#[cfg(test)]
+mod hostile_tests;

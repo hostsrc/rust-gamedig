@@ -47,8 +47,9 @@ impl LegacyVB1_8 {
             return Err(ProtocolFormat.context("Expected 0xFF"));
         }
 
-        let length = buffer.read::<u16>()? * 2;
-        error_by_expected_size((length + 3) as usize, data.len())?;
+        // The length is in UTF-16 units; in usize so `* 2 + 3` can't overflow.
+        let length = usize::from(buffer.read::<u16>()?) * 2;
+        error_by_expected_size(length + 3, data.len())?;
 
         let packet_string = buffer.read_string::<Utf16Decoder<BigEndian>>(None)?;
 
