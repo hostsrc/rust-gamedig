@@ -24,6 +24,11 @@ const DEFAULT_PLAYER_PREALLOCATION: usize = 10;
 /// larger than this in serverinfo we don't allocate that many.
 const MAXIMUM_PLAYER_PREALLOCATION: usize = 50;
 
+/// Most datagrams read for the rules or the players. Those lists are read until
+/// the server stops sending, so a server that never stops gets the first
+/// [MAX_PACKETS] datagrams' worth.
+const MAX_PACKETS: usize = 64;
+
 /// The Unreal2 protocol implementation.
 pub(crate) struct Unreal2Protocol {
     socket: UdpSocket,
@@ -109,7 +114,10 @@ impl Unreal2Protocol {
         };
 
         // We could receive multiple packets in response
-        while let Ok(data) = self.socket.receive(Some(PACKET_SIZE)) {
+        for _ in 1 .. MAX_PACKETS {
+            let Ok(data) = self.socket.receive(Some(PACKET_SIZE)) else {
+                break;
+            };
             let mut buffer = Buffer::<LittleEndian>::new(&data);
 
             // A datagram that isn't a rules reply ends the list (it used to
@@ -138,9 +146,11 @@ impl Unreal2Protocol {
 
         // Fetch first players packet (with retries)
         let mut players_data = self.get_request_data(PacketKind::Players);
+        let mut received_packets = 0;
         // Players are non required so if we don't get any responses we continue to
         // return
         while let Ok(data) = players_data {
+            received_packets += 1;
             let mut buffer = Buffer::<LittleEndian>::new(&data);
 
             Self::consume_response_headers(&mut buffer, PacketKind::Players)?;
@@ -153,6 +163,10 @@ impl Unreal2Protocol {
                     // then we don't need to wait for more player packets to time out.
                     break;
                 }
+            }
+
+            if received_packets == MAX_PACKETS {
+                break;
             }
 
             // Receive next packet
@@ -229,10 +243,9 @@ impl StringDecoder for Unreal2StringDecoder {
 
         // If UCS2 the first byte is the masked length of the string
         let result = if ucs2 {
-            let string_data = &data[start .. start + length];
-            if string_data.len() != length {
-                return Err(PacketBad.context("Not enough data in buffer to read string"));
-            }
+            let string_data = data
+                .get(start .. start + length)
+                .ok_or_else(|| PacketBad.context("Not enough data in buffer to read string"))?;
 
             // When node decodes UCS2 it uses the UFT16LE encoding.
             // https://github.com/nodejs/node/blob/2aaa21f9f684484edb54be30589c4af0b923cdef/lib/buffer.js#L637-L645
@@ -309,3 +322,6 @@ pub fn query(
 }
 
 // TODO: Add tests
+
+#[cfg(test)]
+mod hostile_tests;
