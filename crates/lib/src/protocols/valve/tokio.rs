@@ -106,7 +106,13 @@ impl AsyncValveProtocol {
 
     /// Ask for a specific request only (without retry logic), answering
     /// challenges and skipping stray replies like the blocking client.
-    async fn get_request_packet(&mut self, engine: &Engine, protocol: u8, kind: u8, payload: Vec<u8>) -> GDResult<Packet> {
+    async fn get_request_packet(
+        &mut self,
+        engine: &Engine,
+        protocol: u8,
+        kind: u8,
+        payload: Vec<u8>,
+    ) -> GDResult<Packet> {
         let request_initial_packet = Packet::new(kind, payload).to_bytes();
         self.socket.send(&request_initial_packet).await?;
 
@@ -127,7 +133,9 @@ impl AsyncValveProtocol {
     }
 
     async fn get_server_info(&mut self, engine: &Engine) -> GDResult<ServerInfo> {
-        let packet = self.get_kind_request_packet(engine, 0, Request::Info).await?;
+        let packet = self
+            .get_kind_request_packet(engine, 0, Request::Info)
+            .await?;
         parse_server_info(engine, packet.kind, &packet.payload)
     }
 

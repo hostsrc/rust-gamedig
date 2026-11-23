@@ -214,9 +214,7 @@ pub(super) fn classify_reply(request: u8, reply: u8) -> Reply {
 }
 
 /// The error when [MAX_REPLIES] datagrams came without an answer.
-pub(super) fn too_many_replies() -> crate::GDError {
-    PacketBad.context(format!("no answer in {MAX_REPLIES} replies"))
-}
+pub(super) fn too_many_replies() -> crate::GDError { PacketBad.context(format!("no answer in {MAX_REPLIES} replies")) }
 
 /// Build the request to resend after the server answered with a challenge
 /// (`0x41`, 'A').
@@ -621,13 +619,20 @@ pub(super) mod tests {
     /// `UnknownEnumCast` on a byte of the hostname.
     #[test]
     fn goldsrc_info_reply_is_parsed_in_its_own_layout() {
-        for engine in [Engine::new_gold_src(false), Engine::new_gold_src(true), Engine::Source(None)] {
+        for engine in [
+            Engine::new_gold_src(false),
+            Engine::new_gold_src(true),
+            Engine::Source(None),
+        ] {
             let info = parse_datagram(engine, CAPTURED_INFO_GOLDSRC).unwrap();
             assert_eq!(info.name, "Server hostat de HOSTSRC.IO");
             assert_eq!(info.map, "ze_jp4_reverse");
             assert_eq!(info.folder, "cstrike");
             assert_eq!(info.game_mode, "ZOMBIE ESCAPE DELUXE");
-            assert_eq!((info.players_online, info.players_maximum, info.players_bots), (2, 14, 0));
+            assert_eq!(
+                (info.players_online, info.players_maximum, info.players_bots),
+                (2, 14, 0)
+            );
             assert_eq!(info.protocol_version, 47);
             assert_eq!(info.server_type, Server::Dedicated, "lower-case 'd'");
             assert_eq!(info.environment_type, Environment::Linux, "lower-case 'l'");
@@ -686,7 +691,11 @@ pub(super) mod tests {
 
     #[test]
     fn late_info_replies_are_not_taken_for_players_or_rules() {
-        let (info, players, rules) = (Request::Info as u8, Request::Players as u8, Request::Rules as u8);
+        let (info, players, rules) = (
+            Request::Info as u8,
+            Request::Players as u8,
+            Request::Rules as u8,
+        );
         for request in [info, players, rules] {
             assert_eq!(classify_reply(request, CHALLENGE_REPLY), Reply::Challenge);
         }
