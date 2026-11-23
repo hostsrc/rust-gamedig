@@ -48,6 +48,11 @@ pub(crate) struct GameSpy3 {
 }
 
 const PACKET_SIZE: usize = 2048;
+/// Most datagrams read for one reply (the split number has 7 bits, so a reply
+/// has at most 128 parts). More is
+/// [PacketOverflow](GDErrorKind::PacketOverflow), so a server can't keep a
+/// query looping.
+const MAX_PACKETS: usize = 128;
 const DEFAULT_PAYLOAD: [u8; 4] = [0xFF, 0xFF, 0xFF, 0x01];
 
 impl GameSpy3 {
@@ -148,8 +153,14 @@ impl GameSpy3 {
         let mut values: Vec<Vec<u8>> = Vec::new();
 
         let mut reached_expected_packets_size = false;
+        let mut received_packets = 0;
 
         while !reached_expected_packets_size {
+            if received_packets == MAX_PACKETS {
+                return Err(GDErrorKind::PacketOverflow.context(format!("no last part in {MAX_PACKETS} datagrams")));
+            }
+            received_packets += 1;
+
             let received_data = self.receive(None, 0)?;
             let mut buf = Buffer::<BigEndian>::new(&received_data);
 
@@ -369,7 +380,7 @@ pub fn query(address: &SocketAddr, timeout_settings: Option<TimeoutSettings>) ->
         None => None,
         Some(v) => Some(v.parse::<u8>().map_err(|e| TypeParse.context(e))?),
     };
-    let players_online: u32 = match server_vars.remove("numplayers") {
+    let players_online = match server_vars.remove("numplayers") {
         None => players.len(),
         Some(v) => {
             let reported_players = v.parse().map_err(|e| TypeParse.context(e))?;
@@ -378,7 +389,8 @@ pub fn query(address: &SocketAddr, timeout_settings: Option<TimeoutSettings>) ->
                 false => reported_players,
             }
         }
-    } as u32;
+    };
+    let players_online = u32::try_from(players_online).unwrap_or(u32::MAX);
 
     Ok(Response {
         name: server_vars
@@ -408,3 +420,6 @@ pub fn query(address: &SocketAddr, timeout_settings: Option<TimeoutSettings>) ->
         unused_entries: server_vars,
     })
 }
+
+#[cfg(test)]
+mod hostile_tests;
