@@ -186,7 +186,8 @@ pub fn query(address: &SocketAddr, timeout_settings: Option<TimeoutSettings>) ->
                 false => reported_players,
             }
         }
-    } as u32;
+    };
+    let players_online = u32::try_from(players_online).unwrap_or(u32::MAX);
     let players_minimum = match server_vars.remove("minplayers") {
         None => None,
         Some(v) => Some(v.parse::<u32>().map_err(|e| TypeParse.context(e))?),
@@ -208,3 +209,6 @@ pub fn query(address: &SocketAddr, timeout_settings: Option<TimeoutSettings>) ->
         unused_entries: server_vars,
     })
 }
+
+#[cfg(test)]
+mod hostile_tests;
