@@ -11,8 +11,10 @@ use std::net::{IpAddr, SocketAddr};
 fn parse_players_and_teams(packet: &[u8]) -> GDResult<Vec<Player>> {
     let mut buf = Buffer::<BigEndian>::new(packet);
 
-    let count = buf.read::<u16>()?;
-    let mut players = Vec::with_capacity(count as usize);
+    // The player count isn't used: the list ends with the reply, and
+    // pre-allocating from it let a server pick the allocation size.
+    let _count = buf.read::<u16>()?;
+    let mut players = Vec::new();
 
     while buf.remaining_length() != 0 {
         players.push(Player {
@@ -61,7 +63,8 @@ pub fn query_with_timeout(
                 false => reported_players,
             }
         }
-    } as u32;
+    };
+    let players_online = u32::try_from(players_online).unwrap_or(u32::MAX);
 
     Ok(Response {
         game_version: server_vars.remove("version").ok_or(PacketBad)?,
@@ -73,3 +76,6 @@ pub fn query_with_timeout(
         players_online,
     })
 }
+
+#[cfg(test)]
+mod hostile_tests;
