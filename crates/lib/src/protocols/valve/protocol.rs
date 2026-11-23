@@ -20,7 +20,7 @@ use crate::{
     },
     socket::{Socket, UdpSocket},
     utils::{maybe_gather, retry_on_timeout, u8_lower_upper},
-    GDErrorKind::{BadGame, Decompress, PacketBad},
+    GDErrorKind::{BadGame, Decompress, PacketBad, PacketOverflow},
     GDResult,
 };
 
@@ -87,12 +87,18 @@ impl SplitPacket {
 
     fn get_payload(&self) -> GDResult<Vec<u8>> {
         if let Some(decompressed) = self.decompressed {
+            // The size comes from the server: refuse it before allocating it.
+            let decompressed_size = decompressed.0 as usize;
+            if decompressed_size > MAX_DECOMPRESSED_SIZE {
+                return Err(PacketOverflow.context(format!(
+                    "Decompressed size {decompressed_size} is over the {MAX_DECOMPRESSED_SIZE}-byte limit"
+                )));
+            }
+
             let mut decoder = Decoder::new();
             decoder
                 .write(&self.payload)
                 .map_err(|e| Decompress.context(e))?;
-
-            let decompressed_size = decompressed.0 as usize;
 
             let mut decompressed_payload = vec![0; decompressed_size];
 
@@ -116,6 +122,10 @@ impl SplitPacket {
         }
     }
 }
+
+/// Largest decompressed size accepted for a compressed split response, 1 MiB
+/// (as for TCP and HTTP replies). Larger claims are refused before allocating.
+const MAX_DECOMPRESSED_SIZE: usize = 1024 * 1024;
 
 /// The first datagram of a response: either a complete packet, or the first
 /// chunk of a split response that needs `total - 1` more chunks.
@@ -510,7 +520,9 @@ pub(super) fn parse_server_rules(engine: &Engine, data: &[u8]) -> GDResult<HashM
     let mut buffer = Buffer::<LittleEndian>::new(data);
 
     let count = buffer.read::<u16>()? as usize;
-    let mut rules: HashMap<String, String> = HashMap::with_capacity(count);
+    // Each rule takes at least two bytes (two NULs), so the count can't
+    // reserve more than the reply holds.
+    let mut rules: HashMap<String, String> = HashMap::with_capacity(count.min(buffer.remaining_length() / 2));
 
     for _ in 0 .. count {
         let name = buffer.read_string::<Utf8Decoder>(None)?;
@@ -750,3 +762,6 @@ pub(super) mod tests {
         assert_eq!(classify_reply(0x46, INFO_REPLY_SOURCE), Reply::Answer);
     }
 }
+
+#[cfg(test)]
+mod hostile_tests;
