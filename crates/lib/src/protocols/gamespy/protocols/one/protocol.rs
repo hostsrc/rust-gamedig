@@ -15,8 +15,16 @@ use crate::{
     GDErrorKind,
     GDResult,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
+
+/// Most datagrams read for one status reply. A reply that hasn't sent `final`
+/// by then is an error, so a server can't keep a query looping.
+const MAX_PARTS: usize = 128;
+
+/// Most players read from one reply; later player ids are left in
+/// `unused_entries`.
+const MAX_PLAYERS: usize = 1024;
 
 /// Send status request, and parse response into HashMap.
 /// This function will retry fetch on timeouts.
@@ -42,10 +50,17 @@ fn get_server_values_impl(socket: &mut UdpSocket) -> GDResult<HashMap<String, St
     let mut server_values = HashMap::new();
 
     while !is_finished {
+        if parts.len() >= MAX_PARTS {
+            return Err(GDErrorKind::PacketOverflow.context(format!("no final part in {MAX_PARTS} datagrams")));
+        }
+
         let data = socket.receive(None)?;
         let mut bufferer = Buffer::<LittleEndian>::new(&data);
 
         let mut as_string = bufferer.read_string::<Utf8Decoder>(None)?;
+        if as_string.is_empty() {
+            return Err(GDErrorKind::PacketBad.context("Empty status datagram"));
+        }
         as_string.remove(0);
 
         let splited: Vec<String> = as_string.split('\\').map(str::to_string).collect();
@@ -95,44 +110,61 @@ fn get_server_values_impl(socket: &mut UdpSocket) -> GDResult<HashMap<String, St
     Ok(server_values)
 }
 
-fn extract_players(server_vars: &mut HashMap<String, String>, players_maximum: u32) -> GDResult<Vec<Player>> {
-    let mut players_data: Vec<HashMap<String, String>> = Vec::with_capacity(players_maximum as usize);
+/// Split a `<field>_<id>` player key into its field and id.
+fn player_field(key: &str) -> Option<(&str, usize)> {
+    let split: Vec<&str> = key.split('_').collect();
+
+    if split.len() != 2 {
+        return None;
+    }
+
+    let kind = split[0];
+    let id: usize = split[1].parse().ok()?;
+
+    match kind {
+        "team" | "player" | "playername" | "ping" | "face" | "skin" | "mesh" | "frags" | "ngsecret" | "deaths"
+        | "health" => Some((kind, id)),
+        _ => None,
+    }
+}
+
+/// Collect the `<field>_<id>` entries into players, ordered by id. Nothing is
+/// sized from the reply: `maxplayers` and the ids only order the players. Only
+/// the [MAX_PLAYERS] lowest ids are read; the rest stay in `server_vars`.
+fn extract_players(server_vars: &mut HashMap<String, String>) -> GDResult<Vec<Player>> {
+    let ids: BTreeSet<usize> = server_vars
+        .keys()
+        .filter_map(|key| player_field(key))
+        .map(|(_, id)| id)
+        .collect();
+    let last_id = ids
+        .iter()
+        .nth(MAX_PLAYERS - 1)
+        .copied()
+        .unwrap_or(usize::MAX);
+
+    let mut players_data: BTreeMap<usize, HashMap<String, String>> = BTreeMap::new();
 
     server_vars.retain(|key, value| {
-        let split: Vec<&str> = key.split('_').collect();
+        let Some((kind, id)) = player_field(key) else {
+            return true;
+        };
 
-        if split.len() != 2 {
+        if id > last_id {
             return true;
         }
 
-        let kind = split[0];
-        let id: usize = match split[1].parse() {
-            Ok(v) => v,
-            Err(_) => return true,
-        };
-
-        let early_return = match kind {
-            "team" | "player" | "playername" | "ping" | "face" | "skin" | "mesh" | "frags" | "ngsecret" | "deaths"
-            | "health" => false,
-            _x => true, // println!("UNKNOWN {id} {x} {value}");
-        };
-
-        if early_return {
-            return true;
-        }
-
-        if id >= players_data.len() {
-            let others = vec![HashMap::new(); id - players_data.len() + 1];
-            players_data.extend_from_slice(&others);
-        }
-        players_data[id].insert(kind.to_string(), value.to_string());
+        players_data
+            .entry(id)
+            .or_default()
+            .insert(kind.to_string(), value.to_string());
 
         false
     });
 
     let mut players: Vec<Player> = Vec::with_capacity(players_data.len());
 
-    for player_data in players_data {
+    for player_data in players_data.into_values() {
         let new_player = Player {
             name: match player_data.get("player") {
                 Some(v) => v.clone(),
@@ -207,7 +239,7 @@ pub fn query(address: &SocketAddr, timeout_settings: Option<TimeoutSettings>) ->
         Some(v) => Some(v.parse::<u8>().map_err(|e| TypeParse.context(e))?),
     };
 
-    let players = extract_players(&mut server_vars, players_maximum)?;
+    let players = extract_players(&mut server_vars)?;
 
     Ok(Response {
         name: server_vars
@@ -281,3 +313,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod hostile_tests;
