@@ -112,9 +112,9 @@ impl Unreal2Protocol {
         while let Ok(data) = self.socket.receive(Some(PACKET_SIZE)) {
             let mut buffer = Buffer::<LittleEndian>::new(&data);
 
-            let r = Self::consume_response_headers(&mut buffer, PacketKind::MutatorsAndRules);
-            if r.is_err() {
-                println!("{r:?}");
+            // A datagram that isn't a rules reply ends the list (it used to
+            // be printed to stdout as well).
+            if Self::consume_response_headers(&mut buffer, PacketKind::MutatorsAndRules).is_err() {
                 break;
             }
 
