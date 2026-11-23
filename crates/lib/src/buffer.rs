@@ -41,7 +41,10 @@ impl<'a, B: ByteOrder> Buffer<'a, B> {
 
     /// Returns the length of the remaining bytes from the current cursor
     /// position.
-    pub const fn remaining_length(&self) -> usize { self.data.len() - self.cursor }
+    ///
+    /// Reading a string with no delimiter before the end of the data leaves the
+    /// cursor one past the end, so this saturates at 0 instead of underflowing.
+    pub const fn remaining_length(&self) -> usize { self.data.len().saturating_sub(self.cursor) }
 
     /// Returns the length of the buffer data.
     pub const fn data_length(&self) -> usize { self.data.len() }
@@ -49,7 +52,7 @@ impl<'a, B: ByteOrder> Buffer<'a, B> {
     // TODO: Look into this to make it take ownership of data, not borrowing it
     // There are many instances where we transform this to a vector.
     /// Returns the remaining bytes that have not been read.
-    pub fn remaining_bytes(&self) -> &[u8] { &self.data[self.cursor ..] }
+    pub fn remaining_bytes(&self) -> &[u8] { self.data.get(self.cursor ..).unwrap_or(&[]) }
 
     /// Moves the cursor forward or backward by a specified offset.
     ///
@@ -331,6 +334,9 @@ pub trait StringDecoder {
 /// A decoder for UTF-8 encoded strings.
 ///
 /// This decoder uses a single null byte (`0x00`) as the default delimiter.
+///
+/// Decoding is lossy: bytes that aren't valid UTF-8 (e.g. a Latin-1 `é`,
+/// `0xE9`, in a server name) become U+FFFD instead of failing the whole reply.
 pub struct Utf8Decoder;
 
 impl StringDecoder for Utf8Decoder {
@@ -351,15 +357,9 @@ impl StringDecoder for Utf8Decoder {
             // If the delimiter is not found, use the whole data slice.
             .unwrap_or(data.len());
 
-        // Convert the data until the found position into a UTF-8 string.
-        let result = std::str::from_utf8(
-            // Take a slice of data until the position.
-            &data[.. position]
-        )
-        // If the data cannot be converted into a UTF-8 string, return an error
-            .map_err(|e| PacketBad.context(e))?
-            // Convert the resulting &str into a String
-            .to_owned();
+        // Convert the data until the found position into a UTF-8 string,
+        // replacing invalid sequences with U+FFFD.
+        let result = String::from_utf8_lossy(&data[.. position]).into_owned();
 
         // Update the cursor position
         // The +1 is to skip the delimiter
@@ -373,6 +373,7 @@ impl StringDecoder for Utf8Decoder {
 /// string's length.
 ///
 /// This decoder uses a single null byte (`0x00`) as the default delimiter.
+/// Decoding is lossy, as for [Utf8Decoder].
 pub struct Utf8LengthPrefixedDecoder;
 
 impl StringDecoder for Utf8LengthPrefixedDecoder {
@@ -397,18 +398,13 @@ impl StringDecoder for Utf8LengthPrefixedDecoder {
             .take(length as usize)
             // Find the position of the delimiter
             .position(|&b| b == delimiter.as_ref()[0])
-            // If the delimiter is not found, use the whole data slice.
-            .unwrap_or(length as usize);
+            // If the delimiter is not found, use the whole string, or as much
+            // of it as the data holds (the length byte may claim more).
+            .unwrap_or_else(|| (length as usize).min(data.len() - 1));
 
-        // Convert the data until the found position into a UTF-8 string.
-        let result = std::str::from_utf8(
-            // Take a slice of data until the position.
-            &data[1 .. position + 1]
-        )
-        // If the data cannot be converted into a UTF-8 string, return an error
-            .map_err(|e| PacketBad.context(e))?
-            // Convert the resulting &str into a String
-            .to_owned();
+        // Convert the data until the found position into a UTF-8 string,
+        // replacing invalid sequences with U+FFFD.
+        let result = String::from_utf8_lossy(&data[1 .. position + 1]).into_owned();
 
         // Update the cursor position
         // The +1 is to skip t length
@@ -421,7 +417,7 @@ impl StringDecoder for Utf8LengthPrefixedDecoder {
 /// A decoder for UTF-16 encoded strings.
 ///
 /// This decoder uses a pair of null bytes (`0x00, 0x00`) as the default
-/// delimiter.
+/// delimiter. Decoding is lossy: unpaired surrogates become U+FFFD.
 ///
 /// # Type Parameters
 ///
@@ -444,8 +440,9 @@ impl<B: ByteOrder> StringDecoder for Utf16Decoder<B> {
             .chunks_exact(2)
             // Find the position of the delimiter
             .position(|chunk| chunk == delimiter.as_ref())
-            // If the delimiter is not found, use the whole data, otherwise use the position of the delimiter
-            .map_or(data.len(), |pos| pos * 2);
+            // If the delimiter is not found, use the whole data (minus an odd
+            // trailing byte), otherwise use the position of the delimiter
+            .map_or(data.len() & !1, |pos| pos * 2);
 
         // Create a buffer of u16 values to hold the decoded characters
         let mut paired_buf: Vec<u16> = vec![0; position / 2];
@@ -454,7 +451,7 @@ impl<B: ByteOrder> StringDecoder for Utf16Decoder<B> {
         B::read_u16_into(&data[.. position], &mut paired_buf);
 
         // Convert the buffer of u16 values into a String
-        let result = String::from_utf16(&paired_buf).map_err(|e| PacketBad.context(e))?;
+        let result = String::from_utf16_lossy(&paired_buf);
 
         // Update the cursor position
         // The +2 accounts for the delimiter
@@ -596,6 +593,68 @@ mod tests {
         let result = Utf16Decoder::<BigEndian>::decode_string(data, &mut cursor, delimiter);
         assert_eq!(result.unwrap(), "He");
         assert_eq!(cursor, 6);
+    }
+
+    /// A Latin-1 `é` (0xE9) is not valid UTF-8: it becomes U+FFFD instead of
+    /// failing the string (and with it the whole reply).
+    #[test]
+    fn test_decode_string_utf8_is_lossy() {
+        let data: &[u8] = b"Caf\xE9 server\0next\0";
+        let mut buffer = Buffer::<LittleEndian>::new(data);
+
+        assert_eq!(
+            buffer.read_string::<Utf8Decoder>(None).unwrap(),
+            "Caf\u{FFFD} server"
+        );
+        assert_eq!(buffer.read_string::<Utf8Decoder>(None).unwrap(), "next");
+    }
+
+    #[test]
+    fn test_decode_string_utf8_length_prefixed_is_lossy() {
+        let data: &[u8] = b"\x04Caf\xE9rest";
+        let mut cursor = 0;
+
+        let result = Utf8LengthPrefixedDecoder::decode_string(data, &mut cursor, [0x00]);
+        assert_eq!(result.unwrap(), "Caf\u{FFFD}");
+        assert_eq!(cursor, 5);
+    }
+
+    /// The length byte claims more than the data holds: the string is cut at
+    /// the end of the data instead of slicing out of bounds.
+    #[test]
+    fn test_decode_string_utf8_length_prefixed_overlong_length() {
+        let data: &[u8] = b"\xFFabc";
+        let mut cursor = 0;
+
+        let result = Utf8LengthPrefixedDecoder::decode_string(data, &mut cursor, [0x00]);
+        assert_eq!(result.unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_decode_string_utf16_is_lossy_and_odd_length_safe() {
+        // 'H', an unpaired high surrogate, then one stray byte and no delimiter.
+        let data: &[u8] = &[0x48, 0x00, 0x00, 0xD8, 0x41];
+        let mut cursor = 0;
+
+        let result = Utf16Decoder::<LittleEndian>::decode_string(data, &mut cursor, [0x00, 0x00]);
+        assert_eq!(result.unwrap(), "H\u{FFFD}");
+    }
+
+    /// A reply that ends in a string with no delimiter leaves the cursor past
+    /// the end; reading on must be an error, not an arithmetic underflow.
+    #[test]
+    fn test_read_after_undelimited_string_is_an_error() {
+        let data: &[u8] = b"no delimiter";
+        let mut buffer = Buffer::<LittleEndian>::new(data);
+
+        assert_eq!(
+            buffer.read_string::<Utf8Decoder>(None).unwrap(),
+            "no delimiter"
+        );
+        assert_eq!(buffer.remaining_length(), 0);
+        assert!(buffer.remaining_bytes().is_empty());
+        assert!(buffer.read::<u8>().is_err());
+        assert!(buffer.read_string::<Utf8Decoder>(None).is_err());
     }
 
     #[test]

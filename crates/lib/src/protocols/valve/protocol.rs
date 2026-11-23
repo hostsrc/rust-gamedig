@@ -594,6 +594,7 @@ fn get_response(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::test_support::{fake_udp_server_with, fixture};
 
     /// Captured from a hostsrc CS 1.6 server (81.181.244.29:27015,
     /// 2026-11-22): it answers one `A2S_INFO` with these two datagrams, the
@@ -687,6 +688,45 @@ pub(super) mod tests {
         assert_eq!(info.server_type, Server::Unknown(b'x'));
         assert_eq!(info.environment_type, Environment::Unknown(0));
         assert_eq!(info.game_version, "1.1.2.7/Stdio");
+    }
+
+    /// Info only: players and rules skipped, any app id.
+    pub(in crate::protocols::valve) const INFO_ONLY: GatheringSettings = GatheringSettings {
+        players: crate::protocols::types::GatherToggle::Skip,
+        rules: crate::protocols::types::GatherToggle::Skip,
+        check_app_id: false,
+    };
+
+    /// The captured GoldSrc reply with a Latin-1 `é` (0xE9) in the name. Strict
+    /// UTF-8 failed the whole query with `PacketBad`; now the name is decoded
+    /// lossily.
+    #[test]
+    fn goldsrc_info_reply_with_latin1_name() {
+        let address = fake_udp_server_with(|request| {
+            match request.get(4) {
+                Some(0x54) => vec![fixture!("valve/goldsrc_info_latin1_name.bin").to_vec()],
+                _ => vec![],
+            }
+        });
+        let timeouts = TimeoutSettings::new(
+            Some(std::time::Duration::from_secs(2)),
+            Some(std::time::Duration::from_secs(2)),
+            None,
+            0,
+        )
+        .ok();
+
+        let response = query(
+            &address,
+            Engine::new_gold_src(false),
+            Some(INFO_ONLY),
+            timeouts,
+        )
+        .unwrap();
+
+        assert_eq!(response.info.name, "S\u{FFFD}rver hostat de HOSTSRC.IO");
+        assert_eq!(response.info.map, "ze_jp4_reverse");
+        assert_eq!(response.info.players_online, 2);
     }
 
     #[test]

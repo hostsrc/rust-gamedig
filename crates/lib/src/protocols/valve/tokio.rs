@@ -498,6 +498,32 @@ mod tests {
         assert_eq!(blocking, response);
     }
 
+    /// Same as the blocking `goldsrc_info_reply_with_latin1_name`, on tokio.
+    #[::tokio::test]
+    async fn goldsrc_info_reply_with_latin1_name() {
+        use crate::protocols::valve::protocol::tests::INFO_ONLY;
+        use crate::test_support::{fake_udp_server_with, fixture};
+
+        let address = fake_udp_server_with(|request| {
+            match request.get(4) {
+                Some(0x54) => vec![fixture!("valve/goldsrc_info_latin1_name.bin").to_vec()],
+                _ => vec![],
+            }
+        });
+
+        let response = query(
+            &address,
+            Engine::new_gold_src(false),
+            Some(INFO_ONLY),
+            timeouts(0),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.info.name, "S\u{FFFD}rver hostat de HOSTSRC.IO");
+        assert_eq!(response.info.players_online, 2);
+    }
+
     #[test]
     fn query_future_is_send() {
         fn assert_send<T: Send>(_: &T) {}
