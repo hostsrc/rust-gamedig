@@ -47,6 +47,8 @@ pub mod services;
 mod buffer;
 mod http;
 mod socket;
+#[cfg(test)]
+mod test_support;
 mod utils;
 
 #[cfg(feature = "packet_capture")]

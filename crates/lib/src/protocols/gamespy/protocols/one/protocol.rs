@@ -241,3 +241,43 @@ pub fn query(address: &SocketAddr, timeout_settings: Option<TimeoutSettings>) ->
         unused_entries: server_vars,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{fake_udp_server, fixture};
+    use std::time::Duration;
+
+    /// A 3.5 KB reply in one datagram. With the old 1024-byte receive buffer it
+    /// was cut off before `\final\`, so the query waited for more and failed.
+    #[test]
+    fn reply_larger_than_1024_bytes_is_read_whole() {
+        let datagram = fixture!("gamespy1/status_3k_one_datagram.bin");
+        assert!(datagram.len() > 3000);
+        let address = fake_udp_server(vec![datagram.to_vec()]);
+        let timeouts = TimeoutSettings::new(
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(2)),
+            None,
+            0,
+        )
+        .ok();
+
+        let response = query(&address, timeouts).unwrap();
+
+        assert_eq!(response.name, "hostsrc UT99 test");
+        assert_eq!(response.map, "DM-Deck16][");
+        assert_eq!(
+            (response.players_online, response.players_maximum),
+            (16, 16)
+        );
+        assert_eq!(
+            response.players[15].name,
+            "Player number 15 with a long name"
+        );
+        assert_eq!(
+            response.unused_entries["last_key"],
+            "after the first kilobyte"
+        );
+    }
+}
