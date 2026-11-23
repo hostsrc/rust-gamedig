@@ -140,7 +140,8 @@ pub fn client_query<Client: QuakeClient>(
             .remove("mapname")
             .or_else(|| server_vars.remove("map"))
             .ok_or(GDErrorKind::PacketBad)?,
-        players_online: players.len() as u8,
+        // The field is a u8: more than 255 players saturates instead of wrapping.
+        players_online: u8::try_from(players.len()).unwrap_or(u8::MAX),
         players_maximum: server_vars
             .remove("maxclients")
             .or_else(|| server_vars.remove("sv_maxclients"))
@@ -161,6 +162,9 @@ pub fn remove_wrapping_quotes<'a>(string: &&'a str) -> &'a str {
         .and_then(|inner| inner.strip_suffix('"'))
         .unwrap_or(string)
 }
+
+#[cfg(test)]
+mod hostile_tests;
 
 #[cfg(test)]
 mod tests {
