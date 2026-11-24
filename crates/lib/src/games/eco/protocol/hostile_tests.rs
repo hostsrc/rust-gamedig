@@ -74,3 +74,27 @@ fn hostile_bodies_do_not_panic() {
         assert!(query_body(bytes).is_err());
     });
 }
+
+/// Live servers leave out eight of the fields; the rest still parse.
+#[test]
+fn reply_without_the_fields_live_servers_leave_out_is_parsed() {
+    let mut body: serde_json::Value = serde_json::from_slice(&valid_body()).unwrap();
+    let info = body["Info"].as_object_mut().unwrap();
+    for key in [
+        "GamePort",
+        "TimeSinceStart",
+        "TimeLeft",
+        "SkillSpecializationSetting",
+        "MaxActivePlayers",
+        "IsLimitingHours",
+        "RelayAddress",
+        "JoinUrl",
+    ] {
+        assert!(info.remove(key).is_some(), "{key}");
+    }
+
+    let response = query_body(&serde_json::to_vec(&body).unwrap()).unwrap();
+
+    assert_eq!(response.description, "hostsrc Eco test");
+    assert_eq!(response.players.len(), 2);
+}

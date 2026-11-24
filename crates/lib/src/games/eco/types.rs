@@ -12,8 +12,12 @@ pub struct Root {
     pub info: Info,
 }
 
+/// Every field defaults: live servers (Eco 0.11 and later) leave out
+/// `GamePort`, `TimeSinceStart`, `TimeLeft`, `SkillSpecializationSetting`,
+/// `MaxActivePlayers`, `IsLimitingHours`, `RelayAddress` and `JoinUrl`, and a
+/// missing field used to fail the whole query.
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct Info {
     #[serde(rename = "External")]
     pub external: bool,
