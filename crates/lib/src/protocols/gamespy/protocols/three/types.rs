@@ -6,16 +6,17 @@ use std::collections::HashMap;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// A player’s details.
+/// A player’s details. Every field but the name is `None` when the game
+/// doesn't send it (or sends something that isn't a number).
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Player {
     pub name: String,
-    pub score: i32,
-    pub ping: u16,
-    pub team: u8,
-    pub deaths: u32,
-    pub skill: u32,
+    pub score: Option<i32>,
+    pub ping: Option<u16>,
+    pub team: Option<u8>,
+    pub deaths: Option<u32>,
+    pub skill: Option<u32>,
 }
 
 impl CommonPlayer for Player {
@@ -24,7 +25,7 @@ impl CommonPlayer for Player {
     }
 
     fn name(&self) -> &str { &self.name }
-    fn score(&self) -> Option<i32> { Some(self.score) }
+    fn score(&self) -> Option<i32> { self.score }
 }
 
 /// A team's details
@@ -32,7 +33,7 @@ impl CommonPlayer for Player {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Team {
     pub name: String,
-    pub score: i32,
+    pub score: Option<i32>,
 }
 
 /// A query response.
