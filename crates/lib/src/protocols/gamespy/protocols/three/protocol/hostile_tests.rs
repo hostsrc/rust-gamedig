@@ -109,3 +109,25 @@ fn hostile_replies_do_not_panic() {
         );
     });
 }
+
+/// The player section as real servers send it (laid out like a live
+/// Battlefield 2 reply): a field name right after a separator byte below 3,
+/// a list split over two packets that continues at the offset byte, and
+/// fields some games leave out. Stepping forward over the first letter of
+/// each field name used to leave every list empty.
+#[test]
+fn players_split_over_packets_with_missing_fields() {
+    let first = b"\x01player_\x00\x00alice\x00bob\x00\x00\x01score_\x00\x00\x31\x30\x00x\x00\x00".to_vec();
+    let second = b"player_\x00\x02carol\x00\x00\x01ping_\x00\x00\x35\x30\x00\x00\x00\x01team_t\x00\x00Red\x00\x00".to_vec();
+
+    let (players, teams) = parse_players_and_teams(vec![first, second]).unwrap();
+
+    let names: Vec<&str> = players.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["alice", "bob", "carol"]);
+    assert_eq!((players[0].score, players[0].ping), (Some(10), Some(50)));
+    // "x" isn't a number and bob sent no ping; carol sent neither.
+    assert_eq!((players[1].score, players[1].ping), (None, None));
+    assert_eq!((players[2].score, players[2].skill, players[2].deaths), (None, None, None));
+    assert_eq!(teams.len(), 1);
+    assert_eq!((teams[0].name.as_str(), teams[0].score), ("Red", None));
+}

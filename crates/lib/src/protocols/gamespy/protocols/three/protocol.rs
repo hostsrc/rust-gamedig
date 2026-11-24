@@ -242,11 +242,15 @@ fn parse_players_and_teams(packets: Vec<Vec<u8>>) -> GDResult<(Vec<Player>, Vec<
         let mut buf = Buffer::<LittleEndian>::new(&packet);
 
         while buf.remaining_length() != 0 {
+            // Bytes below 3 separate the sections; anything else is the first
+            // letter of a field name, so step back onto it (GameDig's
+            // `reader.skip(-1)`). Stepping forward instead cut the first letter
+            // ("layer_"), so no field matched and every player list was empty.
             if buf.read::<u8>()? < 3 {
                 continue;
             }
 
-            buf.move_cursor(1)?;
+            buf.move_cursor(-1)?;
 
             let field = buf.read_string::<Utf8Decoder>(None)?;
             if field.is_empty() {
@@ -300,60 +304,37 @@ fn parse_players_and_teams(packets: Vec<Vec<u8>>) -> GDResult<(Vec<Player>, Vec<
         }
     }
 
-    let mut players: Vec<Player> = Vec::new();
-    for player_data in players_data {
-        if player_data.is_empty() {
-            continue;
-        }
-
-        players.push(Player {
-            name: player_data.get("player").ok_or(PacketBad)?.to_string(),
-            score: player_data
-                .get("score")
-                .ok_or(GDErrorKind::PacketBad)?
-                .parse()
-                .map_err(|e| TypeParse.context(e))?,
-            ping: player_data
-                .get("ping")
-                .ok_or(GDErrorKind::PacketBad)?
-                .parse()
-                .map_err(|e| TypeParse.context(e))?,
-            team: player_data
-                .get("team")
-                .ok_or(GDErrorKind::PacketBad)?
-                .parse()
-                .map_err(|e| TypeParse.context(e))?,
-            deaths: player_data
-                .get("deaths")
-                .ok_or(GDErrorKind::PacketBad)?
-                .parse()
-                .map_err(|e| TypeParse.context(e))?,
-            skill: player_data
-                .get("skill")
-                .ok_or(GDErrorKind::PacketBad)?
-                .parse()
-                .map_err(|e| TypeParse.context(e))?,
-        });
+    // Games send different player fields (Crysis Wars has no `skill_`, some
+    // servers no `deaths_`), so each is optional, and a value that isn't a
+    // number reads as not reported rather than failing the whole query. A row
+    // without a name isn't a player.
+    fn number<T: std::str::FromStr>(data: &HashMap<String, String>, key: &str) -> Option<T> {
+        data.get(key).and_then(|value| value.trim().parse().ok())
     }
 
-    let mut teams: Vec<Team> = Vec::new();
-    for team_data in teams_data {
-        if team_data.is_empty() {
-            continue;
-        }
+    let players = players_data
+        .iter()
+        .filter_map(|data| {
+            Some(Player {
+                name: data.get("player")?.to_string(),
+                score: number(data, "score"),
+                ping: number(data, "ping"),
+                team: number(data, "team"),
+                deaths: number(data, "deaths"),
+                skill: number(data, "skill"),
+            })
+        })
+        .collect();
 
-        teams.push(Team {
-            name: team_data
-                .get("team")
-                .ok_or(GDErrorKind::PacketBad)?
-                .to_string(),
-            score: team_data
-                .get("score")
-                .ok_or(GDErrorKind::PacketBad)?
-                .parse()
-                .map_err(|e| TypeParse.context(e))?,
-        });
-    }
+    let teams = teams_data
+        .iter()
+        .filter_map(|data| {
+            Some(Team {
+                name: data.get("team")?.to_string(),
+                score: number(data, "score"),
+            })
+        })
+        .collect();
 
     Ok((players, teams))
 }
