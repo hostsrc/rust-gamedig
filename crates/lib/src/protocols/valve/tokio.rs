@@ -44,7 +44,11 @@ use crate::{
     GDResult,
 };
 
-use std::{collections::HashMap, net::SocketAddr};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 /// Async counterpart of the blocking `ValveProtocol` client.
 struct AsyncValveProtocol {
@@ -86,8 +90,15 @@ impl AsyncValveProtocol {
     }
 
     /// Ask for a specific request only, retrying on send/receive failures
-    /// (including timeouts) like the blocking `retry_on_timeout`.
-    async fn get_kind_request_packet(&mut self, engine: &Engine, protocol: u8, kind: Request) -> GDResult<Packet> {
+    /// (including timeouts) like the blocking `retry_on_timeout`. Also returns
+    /// the round-trip time of the attempt that succeeded (see
+    /// [`get_request_packet`](Self::get_request_packet)).
+    async fn get_kind_request_packet(
+        &mut self,
+        engine: &Engine,
+        protocol: u8,
+        kind: Request,
+    ) -> GDResult<(Packet, Duration)> {
         let mut last_err = PacketReceive.context("Retry count was 0");
 
         for _ in 0 ..= self.retry_count {
@@ -106,20 +117,28 @@ impl AsyncValveProtocol {
 
     /// Ask for a specific request only (without retry logic), answering
     /// challenges and skipping stray replies like the blocking client.
+    ///
+    /// Also returns the round-trip time: from the request to the server's
+    /// first reply, whatever it is. A server that asks for a challenge first
+    /// (Valheim, Rust, many Source servers) takes two round trips to answer;
+    /// timing the whole exchange would show it at twice its ping.
     async fn get_request_packet(
         &mut self,
         engine: &Engine,
         protocol: u8,
         kind: u8,
         payload: Vec<u8>,
-    ) -> GDResult<Packet> {
+    ) -> GDResult<(Packet, Duration)> {
         let request_initial_packet = Packet::new(kind, payload).to_bytes();
+        let sent = Instant::now();
         self.socket.send(&request_initial_packet).await?;
+        let mut round_trip = None;
 
         for _ in 0 .. MAX_REPLIES {
             let packet = self.receive(engine, protocol, PACKET_SIZE).await?;
+            let round_trip = *round_trip.get_or_insert_with(|| sent.elapsed());
             match classify_reply(kind, packet.kind) {
-                Reply::Answer => return Ok(packet),
+                Reply::Answer => return Ok((packet, round_trip)),
                 Reply::Stray => {}
                 Reply::Challenge => {
                     self.socket
@@ -132,22 +151,22 @@ impl AsyncValveProtocol {
         Err(too_many_replies())
     }
 
-    async fn get_server_info(&mut self, engine: &Engine) -> GDResult<ServerInfo> {
-        let packet = self
+    async fn get_server_info(&mut self, engine: &Engine) -> GDResult<(ServerInfo, Duration)> {
+        let (packet, round_trip) = self
             .get_kind_request_packet(engine, 0, Request::Info)
             .await?;
-        parse_server_info(engine, packet.kind, &packet.payload)
+        Ok((parse_server_info(engine, packet.kind, &packet.payload)?, round_trip))
     }
 
     async fn get_server_players(&mut self, engine: &Engine, protocol: u8) -> GDResult<Vec<ServerPlayer>> {
-        let packet = self
+        let (packet, _) = self
             .get_kind_request_packet(engine, protocol, Request::Players)
             .await?;
         parse_server_players(engine, &packet.payload)
     }
 
     async fn get_server_rules(&mut self, engine: &Engine, protocol: u8) -> GDResult<HashMap<String, String>> {
-        let packet = self
+        let (packet, _) = self
             .get_kind_request_packet(engine, protocol, Request::Rules)
             .await?;
         parse_server_rules(engine, &packet.payload)
@@ -166,10 +185,34 @@ pub async fn query(
     gather_settings: Option<GatheringSettings>,
     timeout_settings: Option<TimeoutSettings>,
 ) -> GDResult<Response> {
+    query_timed(address, engine, gather_settings, timeout_settings)
+        .await
+        .map(|timed| timed.response)
+}
+
+/// A [Response] and the server's ping as the query measured it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedResponse {
+    pub response: Response,
+    /// Round-trip time of the info request: from sending it to the server's
+    /// first reply. A challenge reply counts, so a server that asks for one
+    /// isn't shown at twice its ping; a request that timed out and was
+    /// retried counts from the retry.
+    pub info_round_trip: Duration,
+}
+
+/// [query] that also returns the info request's round-trip time, for a ping
+/// column.
+pub async fn query_timed(
+    address: &SocketAddr,
+    engine: Engine,
+    gather_settings: Option<GatheringSettings>,
+    timeout_settings: Option<TimeoutSettings>,
+) -> GDResult<TimedResponse> {
     let gather_settings = gather_settings.unwrap_or_default();
     let mut client = AsyncValveProtocol::new(address, timeout_settings).await?;
 
-    let info = client.get_server_info(&engine).await?;
+    let (info, info_round_trip) = client.get_server_info(&engine).await?;
 
     check_app_id(&engine, &info, &gather_settings)?;
 
@@ -185,10 +228,13 @@ pub async fn query(
         client.get_server_rules(&engine, protocol).await
     );
 
-    Ok(Response {
-        info,
-        players,
-        rules,
+    Ok(TimedResponse {
+        response: Response {
+            info,
+            players,
+            rules,
+        },
+        info_round_trip,
     })
 }
 
@@ -337,11 +383,13 @@ mod tests {
         (address, requests)
     }
 
-    fn timeouts(retries: usize) -> Option<TimeoutSettings> {
+    fn timeouts(retries: usize) -> Option<TimeoutSettings> { timeouts_ms(300, retries) }
+
+    fn timeouts_ms(ms: u64, retries: usize) -> Option<TimeoutSettings> {
         Some(
             TimeoutSettings::new(
-                Some(Duration::from_millis(300)),
-                Some(Duration::from_millis(300)),
+                Some(Duration::from_millis(ms)),
+                Some(Duration::from_millis(ms)),
                 None,
                 retries,
             )
@@ -496,6 +544,73 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(blocking, response);
+    }
+
+    /// A server that challenges `A2S_INFO` (Valheim, Rust) answers after two
+    /// round trips. The ping is the first one: here the challenge comes back
+    /// at once and the info 300 ms later, so timing the whole exchange would
+    /// show 300 ms.
+    #[::tokio::test]
+    async fn info_round_trip_is_the_first_reply_not_the_challenged_answer() {
+        let server = ::tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let challenge = [0x0B, 0xAD, 0xF0, 0x0D];
+        ::tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+                let req = buf[.. n].to_vec();
+                if req[4] != 0x54 {
+                    continue;
+                }
+                if req.ends_with(&challenge) {
+                    ::tokio::time::sleep(Duration::from_millis(300)).await;
+                    server.send_to(&source_info(), peer).await.unwrap();
+                } else {
+                    let reply = [&SIMPLE[..], &[0x41], &challenge].concat();
+                    server.send_to(&reply, peer).await.unwrap();
+                }
+            }
+        });
+
+        let gather = GatheringSettings {
+            players: GatherToggle::Skip,
+            rules: GatherToggle::Skip,
+            check_app_id: false,
+        };
+        let started = Instant::now();
+        let timed = query_timed(&address, Engine::new(240), Some(gather), timeouts_ms(2000, 0))
+            .await
+            .unwrap();
+        let whole = started.elapsed();
+
+        assert_eq!(timed.response.info.name, "hostsrc test");
+        assert!(whole >= Duration::from_millis(300), "the info came after the delay: {whole:?}");
+        assert!(
+            timed.info_round_trip < Duration::from_millis(150),
+            "ping is the challenge round trip, got {:?}",
+            timed.info_round_trip
+        );
+    }
+
+    /// Without a challenge, the round trip is the info reply's.
+    #[::tokio::test]
+    async fn info_round_trip_without_a_challenge_is_the_info_reply() {
+        let (address, _) = spawn_server(false).await;
+        let gather = GatheringSettings {
+            players: GatherToggle::Skip,
+            rules: GatherToggle::Skip,
+            check_app_id: false,
+        };
+        let started = Instant::now();
+        let timed = query_timed(&address, Engine::new(240), Some(gather), timeouts(0))
+            .await
+            .unwrap();
+        assert!(timed.info_round_trip <= started.elapsed());
+        assert_eq!(
+            query(&address, Engine::new(240), Some(gather), timeouts(0)).await.unwrap(),
+            timed.response
+        );
     }
 
     /// Same as the blocking `goldsrc_info_reply_with_latin1_name`, on tokio.
