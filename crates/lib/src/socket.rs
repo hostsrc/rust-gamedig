@@ -109,6 +109,16 @@ impl Socket for TcpSocketImpl {
             address: *address,
         };
 
+        // Send each request at once. With Nagle's algorithm on, a request
+        // written in two parts (Minecraft's handshake, then the status
+        // request) waits for the server to acknowledge the first part: a
+        // whole extra round trip, or the server's delayed-ACK timer, in
+        // every query.
+        socket
+            .socket
+            .set_nodelay(true)
+            .map_err(|e| SocketConnect.context(e))?;
+
         socket.apply_timeout(timeout_settings)?;
 
         Ok(socket)
@@ -311,6 +321,13 @@ mod tests {
     use std::{io::Read, thread};
 
     use super::*;
+
+    #[test]
+    fn tcp_sockets_send_without_waiting_for_an_ack() {
+        let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpSocketImpl::new(&listener.local_addr().unwrap(), &None).unwrap();
+        assert!(socket.socket.nodelay().unwrap());
+    }
 
     #[test]
     fn test_tcp_socket_send_and_receive() {
