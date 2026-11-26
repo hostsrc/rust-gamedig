@@ -24,6 +24,8 @@ mod legacy_v1_4;
 mod legacy_v1_6;
 mod legacy_vb1_8;
 
+pub use java::TimedJavaResponse;
+
 /// Queries a Minecraft server with all the protocol variants one by one (Java
 /// -> Bedrock -> Legacy (1.6 -> 1.4 -> Beta 1.8)).
 pub fn query(
@@ -53,6 +55,16 @@ pub fn query_java(
     request_settings: Option<RequestSettings>,
 ) -> GDResult<JavaResponse> {
     Java::query(address, timeout_settings, request_settings)
+}
+
+/// [query_java] that also returns the status request's round-trip time, for a
+/// ping column.
+pub fn query_java_timed(
+    address: &SocketAddr,
+    timeout_settings: Option<TimeoutSettings>,
+    request_settings: Option<RequestSettings>,
+) -> GDResult<TimedJavaResponse> {
+    Java::query_timed(address, timeout_settings, request_settings)
 }
 
 /// Query a (Java) Legacy Server (1.6 -> 1.4 -> Beta 1.8).

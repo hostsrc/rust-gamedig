@@ -10,7 +10,10 @@ use crate::{
 
 use byteorder::LittleEndian;
 use serde_json::Value;
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 pub struct Java {
     socket: TcpSocket,
@@ -43,17 +46,21 @@ impl Java {
     /// bytes (at most [MAX_STREAM_RESPONSE]). After the status reply the
     /// server keeps the connection open, so reading until it closes would
     /// wait for the timeout and lose the reply.
-    fn receive(&mut self) -> GDResult<Vec<u8>> {
+    ///
+    /// Also returns when the packet's first byte arrived.
+    fn receive(&mut self) -> GDResult<(Vec<u8>, Instant)> {
         let mut length: u32 = 0;
+        let mut first_byte = None;
         for i in 0 .. 5 {
             let byte = self.socket.receive_exact(1)?[0];
+            let first_byte = *first_byte.get_or_insert_with(Instant::now);
             length |= u32::from(byte & 0x7f) << (7 * i);
             if byte & 0x80 == 0 {
                 let length = length as usize;
                 if length == 0 || length > MAX_STREAM_RESPONSE {
                     return Err(PacketBad.context(format!("Bad packet length {length}")));
                 }
-                return self.socket.receive_exact(length);
+                return Ok((self.socket.receive_exact(length)?, first_byte));
             }
         }
         Err(PacketBad.context("Packet length is longer than 5 bytes"))
@@ -93,20 +100,25 @@ impl Java {
 
     /// Send minecraft ping request and parse the response.
     /// This function will retry fetch on timeouts.
-    fn get_info(&mut self) -> GDResult<JavaResponse> {
+    fn get_info(&mut self) -> GDResult<(JavaResponse, Duration)> {
         retry_on_timeout(self.retry_count, move || self.get_info_impl())
     }
 
     /// Send minecraft ping request and parse the response (without retry
-    /// logic).
-    fn get_info_impl(&mut self) -> GDResult<JavaResponse> {
+    /// logic). Also returns the round-trip time: from sending the request to
+    /// the first byte of the status reply. The TCP connect before it and the
+    /// rest of a long reply (a favicon is often 10 KB or more) aren't counted,
+    /// so it reads like the ping a Minecraft client shows.
+    fn get_info_impl(&mut self) -> GDResult<(JavaResponse, Duration)> {
         // No ping before the status reply: proxies such as Velocity answer a
         // ping sent that early with something other than the status, and the
         // pong isn't used.
+        let sent = Instant::now();
         self.send_handshake()?;
         self.send_status_request()?;
 
-        let socket_data = self.receive()?;
+        let (socket_data, first_byte) = self.receive()?;
+        let round_trip = first_byte.saturating_duration_since(sent);
         let mut buffer = Buffer::<LittleEndian>::new(&socket_data);
 
         if get_varint(&mut buffer)? != 0 {
@@ -150,7 +162,7 @@ impl Java {
             }
         };
 
-        Ok(JavaResponse {
+        let response = JavaResponse {
             game_version,
             protocol_version,
             players_maximum: max_players,
@@ -161,7 +173,8 @@ impl Java {
             previews_chat: value_response["previewsChat"].as_bool(),
             enforces_secure_chat: value_response["enforcesSecureChat"].as_bool(),
             server_type: Server::Java,
-        })
+        };
+        Ok((response, round_trip))
     }
 
     pub fn query(
@@ -169,8 +182,30 @@ impl Java {
         timeout_settings: Option<TimeoutSettings>,
         request_settings: Option<RequestSettings>,
     ) -> GDResult<JavaResponse> {
-        Self::new(address, timeout_settings, request_settings)?.get_info()
+        Self::query_timed(address, timeout_settings, request_settings).map(|timed| timed.response)
     }
+
+    pub fn query_timed(
+        address: &SocketAddr,
+        timeout_settings: Option<TimeoutSettings>,
+        request_settings: Option<RequestSettings>,
+    ) -> GDResult<TimedJavaResponse> {
+        let (response, round_trip) = Self::new(address, timeout_settings, request_settings)?.get_info()?;
+        Ok(TimedJavaResponse {
+            response,
+            round_trip,
+        })
+    }
+}
+
+/// A [JavaResponse] and the server's ping as the query measured it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedJavaResponse {
+    pub response: JavaResponse,
+    /// From sending the status request to the first byte of the reply: one
+    /// round trip, without the TCP connect or the rest of a long reply. A
+    /// request that timed out and was retried counts from the retry.
+    pub round_trip: Duration,
 }
 
 #[cfg(test)]
@@ -256,6 +291,43 @@ mod tests {
         assert_eq!(handshake[0], 0x00);
         let port = addr.port().to_be_bytes();
         assert_eq!(&handshake[handshake.len() - 3 ..], &[port[0], port[1], 0x01]);
+    }
+
+    /// A server that answers as soon as the status request is in: the first
+    /// byte of the reply at once, the rest `rest_after` later.
+    fn slow_tail(rest_after: Duration) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            // The status request (frame length 1, packet id 0) ends what the
+            // client sends.
+            while !request.ends_with(&[0x01, 0x00]) {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => request.extend_from_slice(&chunk[.. n]),
+                }
+            }
+            let reply = status_reply();
+            let _ = stream.write_all(&reply[.. 1]);
+            thread::sleep(rest_after);
+            let _ = stream.write_all(&reply[1 ..]);
+            thread::sleep(Duration::from_secs(1));
+        });
+        addr
+    }
+
+    #[test]
+    fn the_round_trip_ends_at_the_first_byte_of_the_reply() {
+        let rest_after = Duration::from_millis(400);
+        let addr = slow_tail(rest_after);
+        let started = Instant::now();
+        let timed = Java::query_timed(&addr, timeouts(), None).unwrap();
+        assert!(started.elapsed() >= rest_after, "{:?}", started.elapsed());
+        assert!(timed.round_trip < Duration::from_millis(200), "{:?}", timed.round_trip);
+        assert_eq!(timed.response.players_online, 12);
     }
 
     #[test]
